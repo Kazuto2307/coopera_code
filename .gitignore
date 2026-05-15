@@ -5,3 +5,8 @@ __pycache__/
 *.pyc
 *.pyo
 *.DS_Store
+
+
+
+# luka gitignore
+Miniconda3-latest-Linux-x86_64.sh
