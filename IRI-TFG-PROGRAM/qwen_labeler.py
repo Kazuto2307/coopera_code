@@ -228,6 +228,7 @@ def _build_profile_grounded_prompt(
         f"{json.dumps(allowed_signals, ensure_ascii=False)}\n\n"
         "Return exactly one JSON object with keys:\n"
         "- preference_snapshot: list of {signal_name, polarity}; polarity is prefer or avoid.\n"
+        "- Copy signal_name values exactly from the allowed list. Do not create variants like prefer_prefer_*.\n"
         "- label_action: one allowed label.\n"
         "- rationale: short explanation grounded in the profile.\n\n"
         "COOPERA HUMAN PROFILE CONTEXT:\n"
@@ -258,14 +259,32 @@ def _validate_preference_snapshot(value: Any) -> list[dict[str, str]]:
     for item in value:
         if not isinstance(item, dict):
             continue
-        signal = str(item.get("signal_name", "")).strip()
+        signal = _canonical_signal_name(str(item.get("signal_name", "")).strip())
         polarity = str(item.get("polarity", "prefer")).strip().lower()
         if signal not in PREFERENCE_SIGNALS:
             raise ValueError(f"Qwen returned unknown preference signal: {signal!r}")
         if polarity not in {"prefer", "avoid"}:
             raise ValueError(f"Qwen returned invalid polarity for {signal!r}: {polarity!r}")
+        if signal.startswith("avoid_") and polarity == "avoid":
+            polarity = "prefer"
         if signal in seen:
             continue
         seen.add(signal)
         out.append({"signal_name": signal, "polarity": polarity})
     return out
+
+
+def _canonical_signal_name(signal: str) -> str:
+    candidates = [signal]
+    if signal.startswith("prefer_prefer_"):
+        candidates.append(signal.replace("prefer_prefer_", "prefer_", 1))
+    if signal.startswith("avoid_avoid_"):
+        candidates.append(signal.replace("avoid_avoid_", "avoid_", 1))
+    if signal.startswith("prefer_avoid_"):
+        candidates.append(signal.replace("prefer_avoid_", "avoid_", 1))
+    if signal.startswith("avoid_prefer_"):
+        candidates.append(signal.replace("avoid_prefer_", "prefer_", 1))
+    for candidate in candidates:
+        if candidate in PREFERENCE_SIGNALS:
+            return candidate
+    return signal

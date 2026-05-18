@@ -392,6 +392,8 @@ def build_preference_profile_prompt(
         "- Do NOT infer preferences from a hypothetical current task or time.\n"
         "- For signals whose name starts with avoid_, use polarity='prefer' when "
         "the human prefers that avoidance rule.\n"
+        "- Copy signal_name values exactly from the allowed list. Do not create "
+        "variants such as prefer_prefer_* or avoid_avoid_*.\n"
         "- Omit weak or unsupported preferences.\n\n"
         "Allowed signal_name values:\n"
         f"{json.dumps(allowed, ensure_ascii=False)}\n\n"
@@ -457,6 +459,8 @@ def build_decision_reflection_prompt(
         "- Do not create new context conditions.\n"
         "- For avoid_* signals, polarity should usually be 'prefer' when the user "
         "prefers that avoidance rule.\n"
+        "- Copy signal_name values exactly from the stable preferences or allowed "
+        "taxonomy. Do not add extra prefixes.\n"
         "- If the scenario conflicts with the profile or lacks enough evidence, "
         "prefer conservative labels such as remind or no_action.\n\n"
         "Return JSON:\n"
@@ -584,17 +588,36 @@ def validate_snapshot(value: Any) -> list[dict[str, str]]:
     for item in value:
         if not isinstance(item, dict):
             continue
-        signal = str(item.get("signal_name", "")).strip()
+        signal = canonical_signal_name(str(item.get("signal_name", "")).strip())
         polarity = str(item.get("polarity", "prefer")).strip().lower()
         if signal not in PREFERENCE_SIGNALS:
             raise ValueError(f"Unknown preference signal: {signal!r}")
         if polarity not in {"prefer", "avoid"}:
             raise ValueError(f"Invalid polarity for {signal!r}: {polarity!r}")
+        if signal.startswith("avoid_") and polarity == "avoid":
+            polarity = "prefer"
         if signal in seen:
             continue
         seen.add(signal)
         out.append({"signal_name": signal, "polarity": polarity})
     return out
+
+
+def canonical_signal_name(signal: str) -> str:
+    """Repair common LLM near-misses while keeping the taxonomy closed."""
+    candidates = [signal]
+    if signal.startswith("prefer_prefer_"):
+        candidates.append(signal.replace("prefer_prefer_", "prefer_", 1))
+    if signal.startswith("avoid_avoid_"):
+        candidates.append(signal.replace("avoid_avoid_", "avoid_", 1))
+    if signal.startswith("prefer_avoid_"):
+        candidates.append(signal.replace("prefer_avoid_", "avoid_", 1))
+    if signal.startswith("avoid_prefer_"):
+        candidates.append(signal.replace("avoid_prefer_", "prefer_", 1))
+    for candidate in candidates:
+        if candidate in PREFERENCE_SIGNALS:
+            return candidate
+    return signal
 
 
 def estimate_calls(
@@ -709,4 +732,3 @@ def _optional_str(value: Any) -> str | None:
 
 if __name__ == "__main__":
     main()
-
