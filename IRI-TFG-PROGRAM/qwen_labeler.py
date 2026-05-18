@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import ast
 import json
 import os
 import re
@@ -22,10 +23,12 @@ class QwenDecisionLabeler:
         model_name: str = "Qwen/Qwen3-VL-8B-Instruct-FP8",
         temperature: float = 0.2,
         max_new_tokens: int = 384,
+        json_retries: int = 1,
     ) -> None:
         self.model_name = model_name
         self.temperature = temperature
         self.max_new_tokens = max_new_tokens
+        self.json_retries = json_retries
         self.model = None
         self.tokenizer = None
 
@@ -158,10 +161,54 @@ class QwenDecisionLabeler:
         assert self.model is not None
         assert self.tokenizer is not None
 
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        parse_errors: list[str] = []
+        raw_responses: list[str] = []
+
+        for attempt in range(self.json_retries + 1):
+            generated = self._generate_from_messages(messages)
+            raw_responses.append(generated)
+            try:
+                payload = _parse_json_object(generated)
+                return payload, {
+                    "raw_response": generated,
+                    "parsed": payload,
+                    "json_parse_attempts": attempt + 1,
+                    "json_parse_errors": parse_errors,
+                    "raw_response_attempts": raw_responses,
+                }
+            except Exception as exc:
+                parse_errors.append(f"{type(exc).__name__}: {exc}")
+                if attempt >= self.json_retries:
+                    raise ValueError(
+                        "Qwen returned malformed JSON after "
+                        f"{attempt + 1} attempt(s): {parse_errors[-1]}\n"
+                        f"Raw response:\n{generated}"
+                    ) from exc
+                messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You repair malformed JSON. Return only one valid JSON "
+                            "object. Do not explain anything."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "The previous assistant response was intended to be JSON, "
+                            "but parsing failed.\n\n"
+                            f"Parser error:\n{parse_errors[-1]}\n\n"
+                            "Malformed response:\n"
+                            f"{generated}\n\n"
+                            "Return the corrected JSON object only."
+                        ),
+                    },
+                ]
+
+        raise RuntimeError("unreachable")
+
+    def _generate_from_messages(self, messages: list[dict[str, str]]) -> str:
         text_prompt = self.tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
@@ -185,9 +232,7 @@ class QwenDecisionLabeler:
 
         prompt_ids = inputs["input_ids"][0]
         generated_ids = outputs[0][len(prompt_ids) :]
-        generated = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-        payload = _parse_json_object(generated)
-        return payload, {"raw_response": generated, "parsed": payload}
+        return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
 
 
 def _build_profile_grounded_prompt(
@@ -240,15 +285,64 @@ def _build_profile_grounded_prompt(
 
 def _parse_json_object(text: str) -> dict[str, Any]:
     stripped = text.strip()
+    stripped = _strip_json_fence(stripped)
     try:
         return json.loads(stripped)
     except json.JSONDecodeError:
         pass
 
-    match = re.search(r"\{.*\}", stripped, flags=re.DOTALL)
-    if not match:
+    candidate = _extract_balanced_json_object(stripped)
+    if candidate is None:
         raise ValueError(f"No JSON object found in model response: {text}")
-    return json.loads(match.group(0))
+    candidate = _strip_json_fence(candidate.strip())
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        repaired = re.sub(r",(\s*[}\]])", r"\1", candidate)
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            pass
+    try:
+        parsed = ast.literal_eval(candidate)
+    except (SyntaxError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed
+    return json.loads(candidate)
+
+
+def _strip_json_fence(text: str) -> str:
+    fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, flags=re.DOTALL | re.IGNORECASE)
+    return fenced.group(1).strip() if fenced else text
+
+
+def _extract_balanced_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for idx in range(start, len(text)):
+        char = text[idx]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : idx + 1]
+    return None
 
 
 def _validate_preference_snapshot(value: Any) -> list[dict[str, str]]:

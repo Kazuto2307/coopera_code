@@ -272,7 +272,9 @@ def get_or_generate_profile_summary(
         system="You summarize COOPERA human profiles. Return only valid JSON.",
         user=build_profile_summary_prompt(profile_context),
     )
-    summary = str(payload.get("summary", "")).strip()
+    summary = payload.get("summary")
+    if isinstance(summary, str):
+        summary = summary.strip()
     if not summary:
         raise ValueError("Profile summary stage returned empty summary.")
     return (
@@ -299,7 +301,10 @@ def generate_preference_profile(
             profile_context=profile_context,
         ),
     )
-    stable_preferences = validate_snapshot(payload.get("stable_preferences", []))
+    stable_preferences = compact_snapshot(
+        validate_snapshot(payload.get("stable_preferences", [])),
+        max_items=8,
+    )
     return (
         {
             "stable_preferences": stable_preferences,
@@ -353,7 +358,10 @@ def reflect_decision(
     label = str(payload.get("label_action", "")).strip()
     if label not in VALID_LABELS:
         raise ValueError(f"Invalid label_action={label!r}")
-    payload["preference_snapshot"] = validate_snapshot(payload.get("preference_snapshot", []))
+    payload["preference_snapshot"] = compact_snapshot(
+        validate_snapshot(payload.get("preference_snapshot", [])),
+        max_items=5,
+    )
     return payload, {"stage": "decision_reflection", **meta}
 
 
@@ -369,7 +377,11 @@ def build_profile_summary_prompt(profile_context: dict[str, Any]) -> str:
         "Focus on stable personality implications: social style, routine style, "
         "autonomy/control, intrusiveness tolerance, reminder style, likely support "
         "domains, and uncertainty. Do not create concrete robot tasks yet.\n\n"
-        "Return JSON with keys: summary, profile_evidence.\n\n"
+        "Use cautious language. Big Five values around 2.5-3.5 are moderate, not low "
+        "or high. Do not make clinical claims or strong claims that are not directly "
+        "supported by the profile.\n\n"
+        "Return JSON with keys: summary, profile_evidence. The summary value must be "
+        "a JSON object, not a string.\n\n"
         f"PROFILE:\n{json.dumps(compact, ensure_ascii=False, indent=2)}"
     )
 
@@ -394,7 +406,14 @@ def build_preference_profile_prompt(
         "the human prefers that avoidance rule.\n"
         "- Copy signal_name values exactly from the allowed list. Do not create "
         "variants such as prefer_prefer_* or avoid_avoid_*.\n"
-        "- Omit weak or unsupported preferences.\n\n"
+        "- Return at most 8 stable_preferences.\n"
+        "- Omit weak or unsupported preferences.\n"
+        "- Put unsupported options in uncertain_or_omitted instead of guessing.\n"
+        "- Do not infer time-of-day preferences, support domains, voice/text mode, "
+        "or data-sharing preferences unless the profile explicitly supports them.\n"
+        "- Avoid contradictory preference axes. For example, do not prefer both "
+        "strict and flexible routine, both proactive and on-demand reminders, or "
+        "both detailed and brief messages.\n\n"
         "Allowed signal_name values:\n"
         f"{json.dumps(allowed, ensure_ascii=False)}\n\n"
         "Return JSON:\n"
@@ -461,6 +480,8 @@ def build_decision_reflection_prompt(
         "prefers that avoidance rule.\n"
         "- Copy signal_name values exactly from the stable preferences or allowed "
         "taxonomy. Do not add extra prefixes.\n"
+        "- Include at most 5 preference_snapshot items, only those directly relevant "
+        "to the scenario decision.\n"
         "- If the scenario conflicts with the profile or lacks enough evidence, "
         "prefer conservative labels such as remind or no_action.\n\n"
         "Return JSON:\n"
@@ -601,6 +622,72 @@ def validate_snapshot(value: Any) -> list[dict[str, str]]:
         seen.add(signal)
         out.append({"signal_name": signal, "polarity": polarity})
     return out
+
+
+def compact_snapshot(
+    snapshot: list[dict[str, str]],
+    *,
+    max_items: int,
+) -> list[dict[str, str]]:
+    """Keep the training signal focused when Qwen over-selects taxonomy entries."""
+    compact: list[dict[str, str]] = []
+    used_axes: set[str] = set()
+    for item in snapshot:
+        axis = preference_axis(item["signal_name"])
+        if axis in used_axes:
+            continue
+        used_axes.add(axis)
+        compact.append(item)
+        if len(compact) >= max_items:
+            break
+    return compact
+
+
+def preference_axis(signal: str) -> str:
+    axes = {
+        "tone": {"prefer_formal_tone", "prefer_friendly_tone"},
+        "message_length": {"prefer_brief_messages", "prefer_detailed_messages"},
+        "confirmation": {
+            "prefer_confirmation_before_action",
+            "prefer_no_confirmation_for_low_risk",
+        },
+        "interaction_mode": {"prefer_voice_interaction", "prefer_text_interaction"},
+        "control": {
+            "prefer_high_robot_autonomy",
+            "prefer_shared_control",
+            "prefer_user_final_decision",
+            "prefer_manual_override_always",
+        },
+        "time_of_day": {
+            "prefer_morning_tasks",
+            "prefer_afternoon_tasks",
+            "prefer_evening_tasks",
+        },
+        "routine": {"prefer_strict_routine", "prefer_flexible_routine"},
+        "reminder_timing": {"prefer_proactive_reminders", "prefer_on_demand_reminders"},
+        "risk_policy": {
+            "prefer_conservative_risk_policy",
+            "prefer_fast_action_under_risk",
+        },
+        "execution_style": {
+            "prefer_step_by_step_guidance",
+            "prefer_do_it_for_me",
+            "prefer_coaching_not_execution",
+        },
+        "proactivity": {
+            "prefer_non_intrusive_assistance",
+            "prefer_proactive_assistance",
+        },
+        "explanation": {
+            "prefer_explain_why_decision",
+            "prefer_explain_alternatives",
+            "prefer_no_explanation",
+        },
+    }
+    for axis, signals in axes.items():
+        if signal in signals:
+            return axis
+    return signal
 
 
 def canonical_signal_name(signal: str) -> str:
