@@ -12,6 +12,7 @@ def load_human_profile_context(
     results_dir: Path,
     response_source: str,
     human_id: str,
+    mypersonality_path: Path | None = None,
 ) -> dict[str, Any]:
     """Load the COOPERA human profile context used to simulate a person.
 
@@ -28,19 +29,39 @@ def load_human_profile_context(
         "mypersonality": None,
     }
 
-    mypersonality_path = (
-        coopera_root
-        / "data"
-        / "humanoids"
-        / "humanoid_data"
-        / "mypersonality_final.csv"
+    resolved_mypersonality_path = resolve_mypersonality_path(
+        coopera_root=coopera_root,
+        explicit_path=mypersonality_path,
     )
-    rows = load_mypersonality_profiles(mypersonality_path)
+    rows = load_mypersonality_profiles(resolved_mypersonality_path)
     human_index = int(human_id) if str(human_id).isdigit() else None
     if human_index is not None and 0 <= human_index < len(rows):
         profile["mypersonality"] = rows[human_index]
 
     return profile
+
+
+def resolve_mypersonality_path(
+    *,
+    coopera_root: Path,
+    explicit_path: Path | None = None,
+) -> Path:
+    if explicit_path is not None:
+        return explicit_path
+
+    candidates = [
+        coopera_root / "data" / "humanoids" / "humanoid_data" / "mypersonality_final.csv",
+        coopera_root
+        / "habitat-lab"
+        / "data"
+        / "versioned_data"
+        / "habitat_humanoids"
+        / "mypersonality_final.csv",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 def load_latest_traits_summary(
@@ -133,4 +154,3 @@ def _float_or_none(value: Any) -> float | None:
         return float(value)
     except Exception:
         return None
-

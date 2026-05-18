@@ -10,6 +10,7 @@ from typing import Any
 from coopera_profile_loader import (
     load_latest_traits_summary,
     load_mypersonality_profiles,
+    resolve_mypersonality_path,
 )
 from preference_taxonomy import PREFERENCE_SIGNALS, VALID_LABELS
 from qwen_labeler import QwenDecisionLabeler
@@ -55,6 +56,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--coopera-root", type=Path, default=coopera_root)
     parser.add_argument(
+        "--mypersonality-path",
+        type=Path,
+        default=None,
+        help="Optional explicit path to mypersonality_final.csv.",
+    )
+    parser.add_argument(
         "--response-source",
         choices=["gpt_response", "llama_response"],
         default="gpt_response",
@@ -82,12 +89,9 @@ def main() -> None:
     args = parse_args()
     coopera_root = args.coopera_root.resolve()
     results_dir = coopera_root / "results"
-    mypersonality_path = (
-        coopera_root
-        / "data"
-        / "humanoids"
-        / "humanoid_data"
-        / "mypersonality_final.csv"
+    mypersonality_path = resolve_mypersonality_path(
+        coopera_root=coopera_root,
+        explicit_path=args.mypersonality_path,
     )
     profiles = load_mypersonality_profiles(mypersonality_path)
     selected_indices = select_profile_indices(
@@ -470,4 +474,3 @@ def _optional_str(value: Any) -> str | None:
 
 if __name__ == "__main__":
     main()
-

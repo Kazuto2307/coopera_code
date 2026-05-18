@@ -145,6 +145,22 @@ python IRI-TFG-PROGRAM/human_sim_preference_data.py \
   --output IRI-TFG-PROGRAM/generated_data/preference_human_sim_human3_day0.jsonl
 ```
 
+El script busca `mypersonality_final.csv` en estas rutas:
+
+```text
+data/humanoids/humanoid_data/mypersonality_final.csv
+habitat-lab/data/versioned_data/habitat_humanoids/mypersonality_final.csv
+```
+
+Si esta en otra ruta:
+
+```bash
+python IRI-TFG-PROGRAM/human_sim_preference_data.py \
+  --mypersonality-path /ruta/a/mypersonality_final.csv \
+  --profile-indices 3 \
+  --max-days 1
+```
+
 Este script es el equivalente conceptual de `human_sim.py`, pero su salida no es
 para Habitat. En vez de generar planes con `Act: [...]`, genera directamente
 muestras del modelo de preferencias:

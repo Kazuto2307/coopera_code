@@ -34,6 +34,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--results-dir", type=Path, default=default_results)
     parser.add_argument(
+        "--mypersonality-path",
+        type=Path,
+        default=None,
+        help="Optional explicit path to mypersonality_final.csv.",
+    )
+    parser.add_argument(
         "--response-source",
         choices=["gpt_response", "llama_response"],
         default="gpt_response",
@@ -114,6 +120,7 @@ def main() -> None:
                     results_dir=args.results_dir,
                     response_source=args.response_source,
                     human_id=plan.human_id,
+                    mypersonality_path=args.mypersonality_path,
                 )
                 profile_cache[plan.human_id] = profile_context
 
