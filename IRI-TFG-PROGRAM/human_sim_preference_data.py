@@ -37,35 +37,24 @@ def parse_args() -> argparse.Namespace:
     program_dir = Path(__file__).resolve().parent
     coopera_root = program_dir.parent
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    default_output = (
-        program_dir
-        / "generated_data"
-        / f"preference_human_sim_{stamp}.jsonl"
-    )
+    default_output = program_dir / "generated_data" / f"preference_human_sim_{stamp}.jsonl"
     default_summary = (
-        program_dir
-        / "generated_data"
-        / f"preference_human_sim_{stamp}_summary.json"
+        program_dir / "generated_data" / f"preference_human_sim_{stamp}_summary.json"
     )
+    default_intermediate = program_dir / "generated_data" / f"preference_human_sim_{stamp}_intermediate"
 
     parser = argparse.ArgumentParser(
         description=(
-            "Human-sim equivalent for the preference model: simulate humans from "
-            "COOPERA personalities and directly generate decision-training JSONL."
+            "COOPERA-style human simulator for the preference model. It generates "
+            "profile-grounded preference-training JSONL through staged Qwen calls."
         )
     )
     parser.add_argument("--coopera-root", type=Path, default=coopera_root)
-    parser.add_argument(
-        "--mypersonality-path",
-        type=Path,
-        default=None,
-        help="Optional explicit path to mypersonality_final.csv.",
-    )
+    parser.add_argument("--mypersonality-path", type=Path, default=None)
     parser.add_argument(
         "--response-source",
         choices=["gpt_response", "llama_response"],
         default="gpt_response",
-        help="Where to look for optional COOPERA traits_summary files.",
     )
     parser.add_argument("--profile-indices", type=int, nargs="+", default=None)
     parser.add_argument("--max-profiles", type=int, default=10)
@@ -74,13 +63,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples-per-hour", type=int, default=1)
     parser.add_argument("--output", type=Path, default=default_output)
     parser.add_argument("--summary-output", type=Path, default=default_summary)
+    parser.add_argument("--intermediate-dir", type=Path, default=default_intermediate)
     parser.add_argument("--qwen-model", default="Qwen/Qwen3-VL-8B-Instruct-FP8")
     parser.add_argument("--qwen-temperature", type=float, default=0.25)
     parser.add_argument("--qwen-max-new-tokens", type=int, default=1800)
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Show the planned generation loops without loading Qwen.",
+        help="Show planned generation loops without loading Qwen.",
     )
     return parser.parse_args()
 
@@ -101,8 +91,18 @@ def main() -> None:
     )
     times = args.times or DEFAULT_TIMES
     days = [str(i).zfill(2) for i in range(args.max_days)]
+    planned_qwen_calls = estimate_calls(
+        profiles=profiles,
+        selected_indices=selected_indices,
+        results_dir=results_dir,
+        response_source=args.response_source,
+        days=days,
+        times=times,
+        samples_per_hour=args.samples_per_hour,
+    )
 
     plan = {
+        "pipeline": "profile_summary -> preference_profile -> scenario -> decision_reflection",
         "coopera_root": str(coopera_root),
         "mypersonality_path": str(mypersonality_path),
         "num_profiles_available": len(profiles),
@@ -110,8 +110,10 @@ def main() -> None:
         "days": days,
         "times": times,
         "samples_per_hour": args.samples_per_hour,
-        "planned_qwen_calls": len(selected_indices) * len(days) * len(times),
+        "planned_qwen_calls": planned_qwen_calls,
         "output": str(args.output),
+        "summary_output": str(args.summary_output),
+        "intermediate_dir": str(args.intermediate_dir),
     }
     print(json.dumps(plan, ensure_ascii=False, indent=2))
 
@@ -144,49 +146,95 @@ def main() -> None:
                 "traits_summary": traits_summary,
             }
 
+            try:
+                profile_summary, profile_summary_meta = get_or_generate_profile_summary(
+                    generator=generator,
+                    profile_context=profile_context,
+                )
+                preference_profile, preference_meta = generate_preference_profile(
+                    generator=generator,
+                    profile_summary=profile_summary,
+                    profile_context=profile_context,
+                )
+                write_intermediate(
+                    args.intermediate_dir,
+                    human_id,
+                    "profile_summary",
+                    profile_summary,
+                    profile_summary_meta,
+                )
+                write_intermediate(
+                    args.intermediate_dir,
+                    human_id,
+                    "preference_profile",
+                    preference_profile,
+                    preference_meta,
+                )
+            except Exception as exc:
+                errors.append(
+                    {
+                        "human_id": human_id,
+                        "stage": "profile_setup",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
+
             for day in days:
                 memory: list[dict[str, Any]] = []
                 for time_text in times:
                     try:
-                        payload, metadata = generator.generate_json(
-                            system=(
-                                "You generate synthetic training data for an "
-                                "assistive-robot decision personalization model. "
-                                "Return only valid JSON."
-                            ),
-                            user=build_generation_prompt(
-                                profile_context=profile_context,
-                                day=day,
-                                time_text=time_text,
-                                samples_per_hour=args.samples_per_hour,
-                                memory=memory,
-                            ),
-                        )
-                        new_samples = normalize_generated_samples(
-                            payload=payload,
-                            metadata=metadata,
-                            profile_context=profile_context,
+                        scenario_payload, scenario_meta = generate_assistance_scenarios(
+                            generator=generator,
+                            profile_summary=profile_summary,
+                            preference_profile=preference_profile,
                             day=day,
                             time_text=time_text,
-                            existing_count=len(samples),
+                            samples_per_hour=args.samples_per_hour,
+                            memory=memory,
                         )
-                        samples.extend(new_samples)
-                        memory.extend(
-                            {
-                                "time": time_text,
-                                "action_input": sample["action_input"],
-                                "context_input": sample["context_input"],
-                                "label_action": sample["label_action"],
-                                "preference_snapshot": sample["preference_snapshot"],
-                            }
-                            for sample in new_samples
-                        )
+                        raw_scenarios = scenario_payload.get("scenarios", [])
+                        if not isinstance(raw_scenarios, list):
+                            raise ValueError("Scenario stage must return a 'scenarios' list.")
+
+                        for scenario_idx, scenario in enumerate(raw_scenarios, start=1):
+                            decision_payload, decision_meta = reflect_decision(
+                                generator=generator,
+                                profile_summary=profile_summary,
+                                preference_profile=preference_profile,
+                                scenario=scenario,
+                                memory=memory,
+                            )
+                            sample = build_sample_from_stages(
+                                profile_context=profile_context,
+                                profile_summary=profile_summary,
+                                preference_profile=preference_profile,
+                                scenario=scenario,
+                                scenario_metadata=scenario_meta,
+                                decision_payload=decision_payload,
+                                decision_metadata=decision_meta,
+                                day=day,
+                                time_text=time_text,
+                                scenario_idx=scenario_idx,
+                                existing_count=len(samples),
+                            )
+                            samples.append(sample)
+                            memory.append(
+                                {
+                                    "time": time_text,
+                                    "action_input": sample["action_input"],
+                                    "context_input": sample["context_input"],
+                                    "label_action": sample["label_action"],
+                                    "preference_snapshot": sample["preference_snapshot"],
+                                }
+                            )
                     except Exception as exc:
                         errors.append(
                             {
                                 "human_id": human_id,
                                 "day": day,
                                 "time": time_text,
+                                "stage": "scenario_or_decision",
                                 "error": f"{type(exc).__name__}: {exc}",
                             }
                         )
@@ -203,144 +251,290 @@ def main() -> None:
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
-def build_generation_prompt(
+def get_or_generate_profile_summary(
     *,
+    generator: QwenDecisionLabeler,
     profile_context: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    traits = profile_context.get("traits_summary")
+    if isinstance(traits, dict) and str(traits.get("res", "")).strip():
+        return (
+            {
+                "source": "existing_coopera_traits_summary",
+                "summary": str(traits.get("res", "")).strip(),
+                "traits_summary_path": traits.get("path"),
+                "big_five": (profile_context.get("mypersonality") or {}).get("big_five"),
+            },
+            {"stage": "profile_summary", "mode": "loaded_existing"},
+        )
+
+    payload, meta = generator.generate_json(
+        system="You summarize COOPERA human profiles. Return only valid JSON.",
+        user=build_profile_summary_prompt(profile_context),
+    )
+    summary = str(payload.get("summary", "")).strip()
+    if not summary:
+        raise ValueError("Profile summary stage returned empty summary.")
+    return (
+        {
+            "source": "generated_from_mypersonality",
+            "summary": summary,
+            "big_five": (profile_context.get("mypersonality") or {}).get("big_five"),
+            "profile_evidence": payload.get("profile_evidence", []),
+        },
+        {"stage": "profile_summary", **meta},
+    )
+
+
+def generate_preference_profile(
+    *,
+    generator: QwenDecisionLabeler,
+    profile_summary: dict[str, Any],
+    profile_context: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    payload, meta = generator.generate_json(
+        system="You infer stable assistive-robot preferences. Return only valid JSON.",
+        user=build_preference_profile_prompt(
+            profile_summary=profile_summary,
+            profile_context=profile_context,
+        ),
+    )
+    stable_preferences = validate_snapshot(payload.get("stable_preferences", []))
+    return (
+        {
+            "stable_preferences": stable_preferences,
+            "profile_level_rationale": payload.get("profile_level_rationale", ""),
+            "uncertain_or_omitted": payload.get("uncertain_or_omitted", []),
+        },
+        {"stage": "preference_profile", **meta},
+    )
+
+
+def generate_assistance_scenarios(
+    *,
+    generator: QwenDecisionLabeler,
+    profile_summary: dict[str, Any],
+    preference_profile: dict[str, Any],
+    day: str,
+    time_text: str,
+    samples_per_hour: int,
+    memory: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    return generator.generate_json(
+        system="You generate assistive-robot situations. Return only valid JSON.",
+        user=build_scenario_prompt(
+            profile_summary=profile_summary,
+            preference_profile=preference_profile,
+            day=day,
+            time_text=time_text,
+            samples_per_hour=samples_per_hour,
+            memory=memory,
+        ),
+    )
+
+
+def reflect_decision(
+    *,
+    generator: QwenDecisionLabeler,
+    profile_summary: dict[str, Any],
+    preference_profile: dict[str, Any],
+    scenario: dict[str, Any],
+    memory: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    payload, meta = generator.generate_json(
+        system="You reflect on robot decisions for a simulated human. Return only valid JSON.",
+        user=build_decision_reflection_prompt(
+            profile_summary=profile_summary,
+            preference_profile=preference_profile,
+            scenario=scenario,
+            memory=memory,
+        ),
+    )
+    label = str(payload.get("label_action", "")).strip()
+    if label not in VALID_LABELS:
+        raise ValueError(f"Invalid label_action={label!r}")
+    payload["preference_snapshot"] = validate_snapshot(payload.get("preference_snapshot", []))
+    return payload, {"stage": "decision_reflection", **meta}
+
+
+def build_profile_summary_prompt(profile_context: dict[str, Any]) -> str:
+    profile = profile_context.get("mypersonality") or {}
+    compact = {
+        "human_id": profile_context.get("human_id"),
+        "big_five": profile.get("big_five"),
+        "profile_text_excerpt": str(profile.get("profile_text", ""))[:5000],
+    }
+    return (
+        "Summarize this COOPERA human profile for later synthetic simulation.\n"
+        "Focus on stable personality implications: social style, routine style, "
+        "autonomy/control, intrusiveness tolerance, reminder style, likely support "
+        "domains, and uncertainty. Do not create concrete robot tasks yet.\n\n"
+        "Return JSON with keys: summary, profile_evidence.\n\n"
+        f"PROFILE:\n{json.dumps(compact, ensure_ascii=False, indent=2)}"
+    )
+
+
+def build_preference_profile_prompt(
+    *,
+    profile_summary: dict[str, Any],
+    profile_context: dict[str, Any],
+) -> str:
+    allowed = sorted(PREFERENCE_SIGNALS)
+    compact = {
+        "human_id": profile_context.get("human_id"),
+        "profile_summary": profile_summary,
+        "big_five": (profile_context.get("mypersonality") or {}).get("big_five"),
+    }
+    return (
+        "Infer a stable assistive-robot preference profile for this human.\n\n"
+        "Rules:\n"
+        "- Use ONLY evidence from the profile summary and Big Five.\n"
+        "- Do NOT infer preferences from a hypothetical current task or time.\n"
+        "- For signals whose name starts with avoid_, use polarity='prefer' when "
+        "the human prefers that avoidance rule.\n"
+        "- Omit weak or unsupported preferences.\n\n"
+        "Allowed signal_name values:\n"
+        f"{json.dumps(allowed, ensure_ascii=False)}\n\n"
+        "Return JSON:\n"
+        "{\n"
+        '  "stable_preferences": [{"signal_name": "...", "polarity": "prefer|avoid"}],\n'
+        '  "profile_level_rationale": "...",\n'
+        '  "uncertain_or_omitted": ["..."]\n'
+        "}\n\n"
+        f"HUMAN:\n{json.dumps(compact, ensure_ascii=False, indent=2)}"
+    )
+
+
+def build_scenario_prompt(
+    *,
+    profile_summary: dict[str, Any],
+    preference_profile: dict[str, Any],
     day: str,
     time_text: str,
     samples_per_hour: int,
     memory: list[dict[str, Any]],
 ) -> str:
-    allowed_signals = sorted(PREFERENCE_SIGNALS)
-    compact_profile = {
-        "human_id": profile_context["human_id"],
-        "mypersonality": profile_context.get("mypersonality"),
-        "traits_summary": profile_context.get("traits_summary"),
-    }
-    memory_tail = memory[-8:]
     return (
-        "Simulate this COOPERA human as a potential user of an assistive robot. "
-        "Generate model-ready training samples directly, not simulator actions.\n\n"
-        "CRITICAL RULES:\n"
-        "- Personal preferences must come from the human profile, Big Five scores, "
-        "traits summary, and simulated personal history. Do not infer preferences "
-        "just because of the current task, object, room, or time.\n"
-        "- Example: breakfast at 9 am does not imply prefer_morning_tasks unless "
-        "the profile supports that preference.\n"
-        "- The robot decision target must reflect what this specific human would "
-        "want the robot to do in the situation.\n"
-        "- Use only the allowed preference signal names.\n"
-        "- Return valid JSON only.\n\n"
-        "Allowed label_action values: do_now, do_later, remind, no_action.\n"
-        "Allowed preference signal_name values:\n"
-        f"{json.dumps(allowed_signals, ensure_ascii=False)}\n\n"
-        "Output schema:\n"
+        "Generate assistive-robot decision situations for this simulated human.\n\n"
+        "Rules:\n"
+        "- Generate plausible situations, not preference labels.\n"
+        "- Do NOT include preference_snapshot or label_action here.\n"
+        "- Do NOT introduce strong context flags such as user_asleep, guests_present, "
+        "adverse_weather, quiet_hours, or user_in_rush unless the profile summary "
+        "or recent memory gives a reason.\n"
+        "- Keep context internally consistent.\n\n"
+        "Return JSON:\n"
         "{\n"
-        '  "samples": [\n'
+        '  "scenarios": [\n'
         "    {\n"
         '      "action_input": {"action_text": "...", "activity": "..."},\n'
-        '      "context_input": {\n'
-        '        "location_current": "...",\n'
-        '        "objects_nearby": ["..."],\n'
-        '        "available_objects": ["..."],\n'
-        '        "raw_conditions": ["..."],\n'
-        '        "time_of_day": "morning|afternoon|evening|night|unknown",\n'
-        '        "weekday": "synthetic_day_XX",\n'
-        '        "user_state": ["busy|in_rush|asleep|nearby|injured_or_disabled"],\n'
-        '        "environment_flags": ["quiet_hours|guests_present|weekend|adverse_weather"]\n'
-        "      },\n"
-        '      "structured_task_features": {\n'
-        '        "kind": "routine_reminder|safety|daily_living_support|social_support|cognitive_support",\n'
-        '        "urgency": "low|medium|high",\n'
-        '        "sensitivity": "low|medium|high",\n'
-        '        "user_busy": false,\n'
-        '        "quiet_hours": false,\n'
-        '        "conditions": ["..."],\n'
-        '        "context_flags": {"user_in_rush": false, "user_asleep": false, "guests_present": false}\n'
-        "      },\n"
-        '      "preference_snapshot": [{"signal_name": "...", "polarity": "prefer|avoid"}],\n'
-        '      "label_action": "do_now|do_later|remind|no_action",\n'
-        '      "rationale": "short profile-grounded explanation"\n'
+        '      "context_input": {"location_current": "...", "objects_nearby": [], "available_objects": [], "raw_conditions": [], "time_of_day": "...", "weekday": "synthetic_day_XX", "user_state": [], "environment_flags": []},\n'
+        '      "structured_task_features": {"kind": "...", "urgency": "low|medium|high", "sensitivity": "low|medium|high", "user_busy": false, "quiet_hours": false, "conditions": [], "context_flags": {}} ,\n'
+        '      "scenario_rationale": "why this situation is plausible for the profile"\n'
         "    }\n"
         "  ]\n"
         "}\n\n"
-        f"Generate {samples_per_hour} sample(s) for day {day}, time {time_text}.\n\n"
-        "HUMAN PROFILE CONTEXT:\n"
-        f"{json.dumps(compact_profile, ensure_ascii=False, indent=2)}\n\n"
-        "RECENT SYNTHETIC HISTORY FOR THIS HUMAN TODAY:\n"
-        f"{json.dumps(memory_tail, ensure_ascii=False, indent=2)}"
+        f"Generate {samples_per_hour} scenario(s) for day {day}, time {time_text}.\n\n"
+        f"PROFILE SUMMARY:\n{json.dumps(profile_summary, ensure_ascii=False, indent=2)}\n\n"
+        f"STABLE PREFERENCES:\n{json.dumps(preference_profile, ensure_ascii=False, indent=2)}\n\n"
+        f"RECENT MEMORY:\n{json.dumps(memory[-8:], ensure_ascii=False, indent=2)}"
     )
 
 
-def normalize_generated_samples(
+def build_decision_reflection_prompt(
     *,
-    payload: dict[str, Any],
-    metadata: dict[str, Any],
+    profile_summary: dict[str, Any],
+    preference_profile: dict[str, Any],
+    scenario: dict[str, Any],
+    memory: list[dict[str, Any]],
+) -> str:
+    return (
+        "Reflect on the robot decision for this scenario.\n\n"
+        "Rules:\n"
+        "- Choose label_action from: do_now, do_later, remind, no_action.\n"
+        "- preference_snapshot must be a subset of the stable preferences unless "
+        "there is direct profile evidence in the summary.\n"
+        "- Do not create new context conditions.\n"
+        "- For avoid_* signals, polarity should usually be 'prefer' when the user "
+        "prefers that avoidance rule.\n"
+        "- If the scenario conflicts with the profile or lacks enough evidence, "
+        "prefer conservative labels such as remind or no_action.\n\n"
+        "Return JSON:\n"
+        "{\n"
+        '  "preference_snapshot": [{"signal_name": "...", "polarity": "prefer|avoid"}],\n'
+        '  "label_action": "do_now|do_later|remind|no_action",\n'
+        '  "decision_rationale": "...",\n'
+        '  "consistency_checks": ["..."]\n'
+        "}\n\n"
+        f"PROFILE SUMMARY:\n{json.dumps(profile_summary, ensure_ascii=False, indent=2)}\n\n"
+        f"STABLE PREFERENCES:\n{json.dumps(preference_profile, ensure_ascii=False, indent=2)}\n\n"
+        f"SCENARIO:\n{json.dumps(scenario, ensure_ascii=False, indent=2)}\n\n"
+        f"RECENT MEMORY:\n{json.dumps(memory[-8:], ensure_ascii=False, indent=2)}"
+    )
+
+
+def build_sample_from_stages(
+    *,
     profile_context: dict[str, Any],
+    profile_summary: dict[str, Any],
+    preference_profile: dict[str, Any],
+    scenario: dict[str, Any],
+    scenario_metadata: dict[str, Any],
+    decision_payload: dict[str, Any],
+    decision_metadata: dict[str, Any],
     day: str,
     time_text: str,
+    scenario_idx: int,
     existing_count: int,
-) -> list[dict[str, Any]]:
-    raw_samples = payload.get("samples")
-    if not isinstance(raw_samples, list):
-        raise ValueError("Qwen response must contain a top-level 'samples' list.")
-
-    out: list[dict[str, Any]] = []
+) -> dict[str, Any]:
     human_id = str(profile_context["human_id"])
     user_id = int(human_id) + 1 if human_id.isdigit() else existing_count + 1
-    for idx, raw in enumerate(raw_samples, start=1):
-        if not isinstance(raw, dict):
-            continue
-        label = str(raw.get("label_action", "")).strip()
-        if label not in VALID_LABELS:
-            raise ValueError(f"Invalid label_action={label!r}")
-        snapshot = validate_snapshot(raw.get("preference_snapshot", []))
-        sample_id = (
-            f"preference_human_sim:{human_id}:{day}:"
-            f"{safe_id(time_text)}:{existing_count + idx}"
-        )
-        action_input = normalize_action_input(raw.get("action_input"))
-        context_input = normalize_context_input(raw.get("context_input"), day=day)
-        structured = normalize_structured_features(raw.get("structured_task_features"))
-        out.append(
-            {
-                "sample_id": sample_id,
-                "user_id": user_id,
-                "user_external_id": f"coopera_human_{human_id}",
-                "label_action": label,
-                "action_input": action_input,
-                "context_input": context_input,
-                "structured_task_features": structured,
-                "preference_snapshot": snapshot,
-                "source_metadata": {
-                    "source": "preference_human_sim_qwen_profile",
-                    "human_id": human_id,
-                    "profile_index": profile_context.get("profile_index"),
-                    "day": day,
-                    "time_text": time_text,
-                    "rationale": raw.get("rationale"),
-                    "traits_summary_path": (
-                        (profile_context.get("traits_summary") or {}).get("path")
-                        if isinstance(profile_context.get("traits_summary"), dict)
-                        else None
-                    ),
-                    "mypersonality_authid": (
-                        (profile_context.get("mypersonality") or {}).get("authid")
-                        if isinstance(profile_context.get("mypersonality"), dict)
-                        else None
-                    ),
-                    "qwen_metadata": metadata,
-                },
-                "data_provenance": {
-                    "action_input": "synthetic_qwen_from_coopera_profile",
-                    "context_input": "synthetic_qwen_from_coopera_profile",
-                    "structured_task_features": "synthetic_qwen_from_coopera_profile",
-                    "preference_snapshot": "synthetic_qwen_from_coopera_profile",
-                    "label_action": "synthetic_qwen_from_coopera_profile",
-                },
-            }
-        )
-    return out
+    label = str(decision_payload.get("label_action", "")).strip()
+    if label not in VALID_LABELS:
+        raise ValueError(f"Invalid label_action={label!r}")
+    snapshot = validate_snapshot(decision_payload.get("preference_snapshot", []))
+    sample_id = (
+        f"preference_human_sim:{human_id}:{day}:{safe_id(time_text)}:"
+        f"{existing_count + scenario_idx}"
+    )
+    return {
+        "sample_id": sample_id,
+        "user_id": user_id,
+        "user_external_id": f"coopera_human_{human_id}",
+        "label_action": label,
+        "action_input": normalize_action_input(scenario.get("action_input")),
+        "context_input": normalize_context_input(scenario.get("context_input"), day=day),
+        "structured_task_features": normalize_structured_features(
+            scenario.get("structured_task_features")
+        ),
+        "preference_snapshot": snapshot,
+        "source_metadata": {
+            "source": "preference_human_sim_multistage_qwen",
+            "human_id": human_id,
+            "profile_index": profile_context.get("profile_index"),
+            "day": day,
+            "time_text": time_text,
+            "scenario_rationale": scenario.get("scenario_rationale"),
+            "decision_rationale": decision_payload.get("decision_rationale"),
+            "consistency_checks": decision_payload.get("consistency_checks", []),
+            "traits_summary_path": profile_summary.get("traits_summary_path"),
+            "mypersonality_authid": (
+                (profile_context.get("mypersonality") or {}).get("authid")
+                if isinstance(profile_context.get("mypersonality"), dict)
+                else None
+            ),
+            "stable_preference_profile": preference_profile,
+            "scenario_metadata": scenario_metadata,
+            "decision_metadata": decision_metadata,
+        },
+        "data_provenance": {
+            "action_input": "synthetic_qwen_scenario_from_coopera_profile",
+            "context_input": "synthetic_qwen_scenario_from_coopera_profile",
+            "structured_task_features": "synthetic_qwen_scenario_from_coopera_profile",
+            "preference_snapshot": "synthetic_qwen_decision_reflection_from_stable_profile",
+            "label_action": "synthetic_qwen_decision_reflection_from_stable_profile",
+        },
+    }
 
 
 def normalize_action_input(value: Any) -> dict[str, Any]:
@@ -403,6 +597,32 @@ def validate_snapshot(value: Any) -> list[dict[str, str]]:
     return out
 
 
+def estimate_calls(
+    *,
+    profiles: list[dict[str, Any]],
+    selected_indices: list[int],
+    results_dir: Path,
+    response_source: str,
+    days: list[str],
+    times: list[str],
+    samples_per_hour: int,
+) -> int:
+    calls = 0
+    for profile_index in selected_indices:
+        human_id = str(profile_index).zfill(5)
+        traits = load_latest_traits_summary(
+            results_dir=results_dir,
+            response_source=response_source,
+            human_id=human_id,
+        )
+        if not traits:
+            calls += 1  # profile_summary
+        calls += 1  # preference_profile
+        calls += len(days) * len(times)  # scenario proposal per hour
+        calls += len(days) * len(times) * samples_per_hour  # decision reflection
+    return calls
+
+
 def select_profile_indices(
     *,
     total: int,
@@ -419,6 +639,21 @@ def write_jsonl(path: Path, samples: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as f:
         for sample in samples:
             f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+
+
+def write_intermediate(
+    base_dir: Path,
+    human_id: str,
+    name: str,
+    payload: dict[str, Any],
+    metadata: dict[str, Any],
+) -> None:
+    target = base_dir / human_id
+    target.mkdir(parents=True, exist_ok=True)
+    (target / f"{name}.json").write_text(
+        json.dumps({"payload": payload, "metadata": metadata}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def summarize(
@@ -474,3 +709,4 @@ def _optional_str(value: Any) -> str | None:
 
 if __name__ == "__main__":
     main()
+

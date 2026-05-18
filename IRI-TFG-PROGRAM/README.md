@@ -169,7 +169,16 @@ muestras del modelo de preferencias:
 COOPERA mypersonality + Big Five + traits_summary opcional
         |
         v
-Qwen simula situaciones de asistencia para esa persona
+profile_summary
+        |
+        v
+preference_profile estable
+        |
+        v
+assistance_situation por hora
+        |
+        v
+decision_reflection
         |
         v
 action_input + context_input + structured_task_features
@@ -191,6 +200,17 @@ python IRI-TFG-PROGRAM/human_sim_preference_data.py \
 ```
 
 Este es el camino mas directo si tu objetivo es dataset, no simulacion fisica.
+
+La estructura imita COOPERA: no se pide a Qwen que genere todo de golpe. Primero
+compacta la persona, despues infiere preferencias estables, despues propone una
+situacion, y finalmente reflexiona la decision del robot. Los intermedios se
+guardan en:
+
+```text
+IRI-TFG-PROGRAM/generated_data/<run>_intermediate/<human_id>/
+  profile_summary.json
+  preference_profile.json
+```
 
 Para una prueba pequena en servidor:
 
