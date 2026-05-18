@@ -199,6 +199,24 @@ python IRI-TFG-PROGRAM/human_sim_preference_data.py \
   --dry-run
 ```
 
+Durante una ejecucion real, el script muestra un resumen visual del plan y
+barras de progreso para perfiles y muestras si `tqdm` esta instalado. Si no lo
+esta, usa mensajes simples de progreso. Para desactivar las barras:
+
+```bash
+python IRI-TFG-PROGRAM/human_sim_preference_data.py \
+  --max-profiles 20 \
+  --max-days 5 \
+  --samples-per-hour 1 \
+  --no-progress
+```
+
+Si quieres conservar tambien el plan completo en JSON por terminal:
+
+```bash
+--plan-json
+```
+
 Este es el camino mas directo si tu objetivo es dataset, no simulacion fisica.
 
 La estructura imita COOPERA: no se pide a Qwen que genere todo de golpe. Primero

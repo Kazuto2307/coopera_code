@@ -68,6 +68,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qwen-temperature", type=float, default=0.25)
     parser.add_argument("--qwen-max-new-tokens", type=int, default=1800)
     parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable progress bars and use plain terminal output.",
+    )
+    parser.add_argument(
+        "--plan-json",
+        action="store_true",
+        help="Also print the full run plan as JSON at startup.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show planned generation loops without loading Qwen.",
@@ -100,6 +110,7 @@ def main() -> None:
         times=times,
         samples_per_hour=args.samples_per_hour,
     )
+    planned_samples = len(selected_indices) * len(days) * len(times) * args.samples_per_hour
 
     plan = {
         "pipeline": "profile_summary -> preference_profile -> scenario -> decision_reflection",
@@ -115,7 +126,11 @@ def main() -> None:
         "summary_output": str(args.summary_output),
         "intermediate_dir": str(args.intermediate_dir),
     }
-    print(json.dumps(plan, ensure_ascii=False, indent=2))
+    print_run_plan(
+        plan=plan,
+        planned_samples=planned_samples,
+        show_json=args.plan_json,
+    )
 
     if args.dry_run:
         return
@@ -130,10 +145,17 @@ def main() -> None:
 
     samples: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
+    progress = ProgressDisplay(
+        enabled=not args.no_progress,
+        total_profiles=len(selected_indices),
+        total_samples=planned_samples,
+    )
+    progress.start()
     try:
         for profile_index in selected_indices:
             profile = profiles[profile_index]
             human_id = str(profile_index).zfill(5)
+            progress.profile_start(human_id=human_id, profile_index=profile_index)
             traits_summary = load_latest_traits_summary(
                 results_dir=results_dir,
                 response_source=args.response_source,
@@ -147,10 +169,12 @@ def main() -> None:
             }
 
             try:
+                progress.stage("profile_summary", human_id=human_id)
                 profile_summary, profile_summary_meta = get_or_generate_profile_summary(
                     generator=generator,
                     profile_context=profile_context,
                 )
+                progress.stage("preference_profile", human_id=human_id)
                 preference_profile, preference_meta = generate_preference_profile(
                     generator=generator,
                     profile_summary=profile_summary,
@@ -178,12 +202,24 @@ def main() -> None:
                         "error": f"{type(exc).__name__}: {exc}",
                     }
                 )
+                progress.error(
+                    human_id=human_id,
+                    stage="profile_setup",
+                    message=f"{type(exc).__name__}: {exc}",
+                )
+                progress.profile_done()
                 continue
 
             for day in days:
                 memory: list[dict[str, Any]] = []
                 for time_text in times:
                     try:
+                        progress.stage(
+                            "scenario",
+                            human_id=human_id,
+                            day=day,
+                            time_text=time_text,
+                        )
                         scenario_payload, scenario_meta = generate_assistance_scenarios(
                             generator=generator,
                             profile_summary=profile_summary,
@@ -198,6 +234,13 @@ def main() -> None:
                             raise ValueError("Scenario stage must return a 'scenarios' list.")
 
                         for scenario_idx, scenario in enumerate(raw_scenarios, start=1):
+                            progress.stage(
+                                "decision_reflection",
+                                human_id=human_id,
+                                day=day,
+                                time_text=time_text,
+                                scenario_idx=scenario_idx,
+                            )
                             decision_payload, decision_meta = reflect_decision(
                                 generator=generator,
                                 profile_summary=profile_summary,
@@ -228,6 +271,7 @@ def main() -> None:
                                     "preference_snapshot": sample["preference_snapshot"],
                                 }
                             )
+                            progress.sample(label=sample["label_action"])
                     except Exception as exc:
                         errors.append(
                             {
@@ -238,7 +282,14 @@ def main() -> None:
                                 "error": f"{type(exc).__name__}: {exc}",
                             }
                         )
+                        progress.error(
+                            human_id=human_id,
+                            stage="scenario_or_decision",
+                            message=f"{type(exc).__name__}: {exc}",
+                        )
+            progress.profile_done()
     finally:
+        progress.close()
         generator.close()
 
     write_jsonl(args.output, samples)
@@ -248,7 +299,210 @@ def main() -> None:
         json.dumps(summary, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    print_run_summary(summary)
+
+
+def print_run_plan(
+    *,
+    plan: dict[str, Any],
+    planned_samples: int,
+    show_json: bool,
+) -> None:
+    print("")
+    print("=" * 72)
+    print("COOPERA preference synthetic data run")
+    print("=" * 72)
+    print(f"Pipeline          : {plan['pipeline']}")
+    print(f"Profiles selected : {len(plan['profile_indices'])} / {plan['num_profiles_available']}")
+    print(f"Days              : {len(plan['days'])} -> {', '.join(plan['days'])}")
+    print(f"Hours per day     : {len(plan['times'])} -> {', '.join(plan['times'])}")
+    print(f"Samples per hour  : {plan['samples_per_hour']}")
+    print(f"Target samples    : {planned_samples}")
+    print(f"Planned Qwen calls: {plan['planned_qwen_calls']}")
+    print("")
+    print(f"Profiles CSV      : {plan['mypersonality_path']}")
+    print(f"Output JSONL      : {plan['output']}")
+    print(f"Summary JSON      : {plan['summary_output']}")
+    print(f"Intermediates     : {plan['intermediate_dir']}")
+    print("=" * 72)
+    if show_json:
+        print("")
+        print("Full plan JSON:")
+        print(json.dumps(plan, ensure_ascii=False, indent=2))
+
+
+def print_run_summary(summary: dict[str, Any]) -> None:
+    print("")
+    print("=" * 72)
+    print("Generation summary")
+    print("=" * 72)
+    print(f"Samples generated : {summary['num_samples']}")
+    print(f"Errors            : {summary['num_errors']}")
+    print(f"Output JSONL      : {summary['output']}")
+    print(f"Summary JSON      : {summary['summary_output']}")
+    print("")
+    print("Labels:")
+    print_counter(summary.get("labels", {}))
+    print("")
+    print("Activities:")
+    print_counter(summary.get("activities", {}), limit=10)
+    print("")
+    print("Top preference signals:")
+    print_counter(summary.get("top_preference_signals", {}), limit=12)
+    if summary.get("errors_preview"):
+        print("")
+        print("Errors preview:")
+        for item in summary["errors_preview"][:5]:
+            print(f"- {item}")
+    print("=" * 72)
+
+
+def print_counter(values: dict[str, int], *, limit: int | None = None) -> None:
+    if not values:
+        print("  none")
+        return
+    rows = list(values.items())
+    if limit is not None:
+        rows = rows[:limit]
+    width = max(len(str(key)) for key, _ in rows)
+    for key, count in rows:
+        print(f"  {str(key).ljust(width)} : {count}")
+
+
+class ProgressDisplay:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        total_profiles: int,
+        total_samples: int,
+    ) -> None:
+        self.enabled = enabled
+        self.total_profiles = total_profiles
+        self.total_samples = total_samples
+        self.generated_samples = 0
+        self.generated_profiles = 0
+        self.error_count = 0
+        self.label_counts: Counter[str] = Counter()
+        self._tqdm: Any = None
+        self._profiles_bar: Any = None
+        self._samples_bar: Any = None
+
+    def start(self) -> None:
+        if not self.enabled:
+            print("")
+            print("Progress bars disabled.")
+            return
+        try:
+            from tqdm import tqdm
+        except Exception:
+            self.enabled = False
+            print("")
+            print("tqdm is not installed. Using simple progress messages.")
+            return
+        self._tqdm = tqdm
+        print("")
+        self._profiles_bar = tqdm(
+            total=self.total_profiles,
+            desc="Profiles",
+            unit="profile",
+            position=0,
+            leave=True,
+        )
+        self._samples_bar = tqdm(
+            total=self.total_samples,
+            desc="Samples",
+            unit="sample",
+            position=1,
+            leave=True,
+        )
+
+    def profile_start(self, *, human_id: str, profile_index: int) -> None:
+        text = f"Starting human {human_id} (profile_index={profile_index})"
+        if self._profiles_bar is not None:
+            self._profiles_bar.set_description(f"Profiles human={human_id}")
+            self._write(text)
+        else:
+            print("")
+            print(text)
+
+    def profile_done(self) -> None:
+        self.generated_profiles += 1
+        if self._profiles_bar is not None:
+            self._profiles_bar.update(1)
+            self._profiles_bar.set_postfix(
+                samples=self.generated_samples,
+                errors=self.error_count,
+            )
+
+    def stage(
+        self,
+        stage: str,
+        *,
+        human_id: str,
+        day: str | None = None,
+        time_text: str | None = None,
+        scenario_idx: int | None = None,
+    ) -> None:
+        parts = [stage, f"human={human_id}"]
+        if day is not None:
+            parts.append(f"day={day}")
+        if time_text is not None:
+            parts.append(f"time={time_text}")
+        if scenario_idx is not None:
+            parts.append(f"scenario={scenario_idx}")
+        text = " | ".join(parts)
+        if self._samples_bar is not None:
+            self._samples_bar.set_postfix(
+                stage=stage,
+                human=human_id,
+                errors=self.error_count,
+                refresh=False,
+            )
+        elif not self.enabled:
+            return
+        else:
+            print(text)
+
+    def sample(self, *, label: str) -> None:
+        self.generated_samples += 1
+        self.label_counts[label] += 1
+        if self._samples_bar is not None:
+            self._samples_bar.update(1)
+            self._samples_bar.set_postfix(
+                last_label=label,
+                errors=self.error_count,
+            )
+            return
+        if self.generated_samples == 1 or self.generated_samples % 25 == 0:
+            self._print_plain_sample(label)
+        elif self.generated_samples == self.total_samples:
+            self._print_plain_sample(label)
+
+    def error(self, *, human_id: str, stage: str, message: str) -> None:
+        self.error_count += 1
+        self._write(f"ERROR human={human_id} stage={stage}: {message}")
+        if self._samples_bar is not None:
+            self._samples_bar.set_postfix(errors=self.error_count)
+
+    def close(self) -> None:
+        if self._samples_bar is not None:
+            self._samples_bar.close()
+        if self._profiles_bar is not None:
+            self._profiles_bar.close()
+
+    def _write(self, text: str) -> None:
+        if self._tqdm is not None:
+            self._tqdm.write(text)
+        else:
+            print(text)
+
+    def _print_plain_sample(self, label: str) -> None:
+        total = self.total_samples or "?"
+        print(
+            f"Samples: {self.generated_samples}/{total} "
+            f"| last_label={label} | errors={self.error_count}"
+        )
 
 
 def get_or_generate_profile_summary(
