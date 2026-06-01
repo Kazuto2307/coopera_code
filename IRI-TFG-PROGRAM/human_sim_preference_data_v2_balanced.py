@@ -122,6 +122,15 @@ def parse_args() -> argparse.Namespace:
             "its actual label still has remaining quota."
         ),
     )
+    parser.add_argument(
+        "--routine-consistency",
+        choices=["enforce", "off"],
+        default="enforce",
+        help=(
+            "When enabled, reject attempts where the same human/context/routine "
+            "signature was previously accepted with a different label."
+        ),
+    )
     parser.add_argument("--output", type=Path, default=default_output)
     parser.add_argument("--summary-output", type=Path, default=default_summary)
     parser.add_argument("--intermediate-dir", type=Path, default=default_intermediate)
@@ -184,6 +193,7 @@ def main() -> None:
         "target_label_counts": dict(label_targets),
         "max_attempts_per_sample": args.max_attempts_per_sample,
         "accept_mismatch_if_useful": args.accept_mismatch_if_useful,
+        "routine_consistency": args.routine_consistency,
         "planned_qwen_calls_max": planned_qwen_calls,
         "output": str(args.output),
         "summary_output": str(args.summary_output),
@@ -208,6 +218,8 @@ def main() -> None:
     errors: list[dict[str, str]] = []
     accepted_counts: Counter[str] = Counter()
     mismatch_counts: Counter[str] = Counter()
+    consistency_counts: Counter[str] = Counter()
+    routine_registry: dict[str, dict[str, Any]] = {}
     profile_cache: dict[int, dict[str, Any]] = {}
     memory_by_profile_day: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     progress = ProgressDisplay(
@@ -270,6 +282,9 @@ def main() -> None:
                 existing_count=len(samples),
                 max_attempts=args.max_attempts_per_sample,
                 accept_mismatch_if_useful=args.accept_mismatch_if_useful,
+                routine_consistency=args.routine_consistency,
+                routine_registry=routine_registry,
+                consistency_counts=consistency_counts,
                 progress=progress,
             )
             errors.extend(attempt_errors)
@@ -281,6 +296,11 @@ def main() -> None:
             accepted_counts[actual_label] += 1
             if actual_label != target_label:
                 mismatch_counts[f"{target_label}->{actual_label}"] += 1
+            register_routine(
+                sample=sample,
+                routine_registry=routine_registry,
+                consistency_counts=consistency_counts,
+            )
             memory.append(
                 {
                     "time": time_text,
@@ -300,6 +320,11 @@ def main() -> None:
     summary["target_label_counts"] = dict(label_targets)
     summary["accepted_label_counts"] = dict(accepted_counts)
     summary["mismatch_counts"] = dict(mismatch_counts)
+    summary["routine_consistency"] = {
+        "mode": args.routine_consistency,
+        "unique_routines": len(routine_registry),
+        **dict(consistency_counts),
+    }
     summary["missing_label_counts"] = {
         label: max(label_targets[label] - accepted_counts[label], 0)
         for label in label_targets
@@ -389,6 +414,9 @@ def generate_balanced_sample(
     existing_count: int,
     max_attempts: int,
     accept_mismatch_if_useful: bool,
+    routine_consistency: str,
+    routine_registry: dict[str, dict[str, Any]],
+    consistency_counts: Counter[str],
     progress: ProgressDisplay,
 ) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
     profile_context = profile_bundle["profile_context"]
@@ -451,6 +479,29 @@ def generate_balanced_sample(
             )
             sample["source_metadata"]["target_label"] = target_label
             sample["source_metadata"]["balanced_attempt"] = attempt
+            signature = routine_signature(sample)
+            sample["source_metadata"]["routine_signature"] = signature
+            if routine_consistency == "enforce":
+                existing = routine_registry.get(signature)
+                if existing and existing["label_action"] != sample["label_action"]:
+                    consistency_counts["routine_label_conflicts_rejected"] += 1
+                    attempt_errors.append(
+                        {
+                            "human_id": human_id,
+                            "day": day,
+                            "time": time_text,
+                            "stage": "routine_label_conflict",
+                            "error": (
+                                "same routine signature already exists with "
+                                f"label={existing['label_action']}; "
+                                f"new_label={sample['label_action']}; "
+                                f"target={target_label}; attempt={attempt}"
+                            ),
+                        }
+                    )
+                    continue
+                if existing:
+                    consistency_counts["same_label_duplicate_routines_seen"] += 1
             last_sample = sample
             if sample["label_action"] == target_label:
                 return sample, attempt_errors
@@ -486,6 +537,90 @@ def generate_balanced_sample(
         return last_sample, attempt_errors
 
     return None, attempt_errors
+
+
+def register_routine(
+    *,
+    sample: dict[str, Any],
+    routine_registry: dict[str, dict[str, Any]],
+    consistency_counts: Counter[str],
+) -> None:
+    signature = sample.get("source_metadata", {}).get("routine_signature")
+    if not signature:
+        signature = routine_signature(sample)
+        sample.setdefault("source_metadata", {})["routine_signature"] = signature
+    if signature not in routine_registry:
+        consistency_counts["unique_routines_registered"] += 1
+        routine_registry[signature] = {
+            "sample_id": sample.get("sample_id"),
+            "label_action": sample.get("label_action"),
+            "action_input": sample.get("action_input"),
+            "context_input": sample.get("context_input"),
+            "structured_task_features": sample.get("structured_task_features"),
+            "user_external_id": sample.get("user_external_id"),
+        }
+
+
+def routine_signature(sample: dict[str, Any]) -> str:
+    action = sample.get("action_input") or {}
+    context = sample.get("context_input") or {}
+    features = sample.get("structured_task_features") or {}
+    key = {
+        "user_external_id": sample.get("user_external_id"),
+        "action_text": normalize_key_text(action.get("action_text")),
+        "activity": normalize_key_text(action.get("activity")),
+        "location_current": normalize_key_text(context.get("location_current")),
+        "time_of_day": normalize_key_text(context.get("time_of_day")),
+        "raw_conditions": normalize_key_list(context.get("raw_conditions")),
+        "user_state": normalize_key_list(context.get("user_state")),
+        "environment_flags": normalize_key_list(context.get("environment_flags")),
+        "kind": normalize_key_text(features.get("kind")),
+        "urgency": normalize_key_text(features.get("urgency")),
+        "sensitivity": normalize_key_text(features.get("sensitivity")),
+        "user_busy": bool(features.get("user_busy", False)),
+        "quiet_hours": bool(features.get("quiet_hours", False)),
+        "conditions": normalize_key_list(features.get("conditions")),
+        "context_flags": normalize_key_dict(features.get("context_flags")),
+    }
+    return json.dumps(key, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def normalize_key_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = " ".join(str(value).strip().lower().split())
+    return text or None
+
+
+def normalize_key_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return sorted(
+        item
+        for item in (normalize_key_text(entry) for entry in value)
+        if item
+    )
+
+
+def normalize_key_dict(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, Any] = {}
+    for key, item in sorted(value.items(), key=lambda row: str(row[0])):
+        norm_key = normalize_key_text(key)
+        if not norm_key:
+            continue
+        if isinstance(item, list):
+            normalized[norm_key] = normalize_key_list(item)
+        elif isinstance(item, dict):
+            normalized[norm_key] = normalize_key_dict(item)
+        elif isinstance(item, bool):
+            normalized[norm_key] = item
+        elif item is None:
+            normalized[norm_key] = None
+        else:
+            normalized[norm_key] = normalize_key_text(item)
+    return normalized
 
 
 def generate_targeted_scenario(
@@ -759,6 +894,7 @@ def print_balanced_plan(*, plan: dict[str, Any], show_json: bool) -> None:
     print(f"Target samples        : {plan['target_samples']}")
     print(f"Max Qwen calls        : {plan['planned_qwen_calls_max']}")
     print(f"Attempts per sample   : {plan['max_attempts_per_sample']}")
+    print(f"Routine consistency   : {plan['routine_consistency']}")
     print("")
     print("Target label counts:")
     print_counter(plan["target_label_counts"])
@@ -796,6 +932,10 @@ def print_balanced_summary(summary: dict[str, Any]) -> None:
         print("")
         print("Accepted mismatches:")
         print_counter(summary["mismatch_counts"])
+    if summary.get("routine_consistency"):
+        print("")
+        print("Routine consistency:")
+        print_counter(summary["routine_consistency"])
     print("")
     print("Top preference signals:")
     print_counter(summary.get("top_preference_signals", {}), limit=12)
