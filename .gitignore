@@ -10,3 +10,5 @@ __pycache__/
 
 # luka gitignore
 Miniconda3-latest-Linux-x86_64.sh
+IRI-TFG-PROGRAM/generated_data_download/
+IRI-TFG-PROGRAM/generated_data/
