@@ -33,7 +33,7 @@ from preference_taxonomy import VALID_LABELS
 from qwen_labeler import QwenDecisionLabeler
 
 
-LABEL_ORDER = ["do_now", "do_later", "remind", "no_action"]
+LABEL_ORDER = ["do_now", "do_later", "tell_the_user", "no_action"]
 LABEL_GUIDANCE = {
     "do_now": (
         "Create a low-risk, useful, timely situation where immediate robot help is "
@@ -44,9 +44,9 @@ LABEL_GUIDANCE = {
         "timing, context, user state, privacy, interruption cost, or dependency "
         "makes immediate execution inappropriate."
     ),
-    "remind": (
-        "Create a situation where the robot should remind, notify, or ask the user "
-        "rather than physically executing the task."
+    "tell_the_user": (
+        "Create a situation where the robot should tell, notify, or ask the user "
+        "rather than physically executing the task itself."
     ),
     "no_action": (
         "Create a situation where the robot should stay passive because help would "
@@ -105,7 +105,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional JSON dict of label weights, e.g. "
-            "'{\"do_now\": 0.25, \"do_later\": 0.25, \"remind\": 0.25, \"no_action\": 0.25}'."
+            "'{\"do_now\": 0.25, \"do_later\": 0.25, \"tell_the_user\": 0.25, \"no_action\": 0.25}'."
         ),
     )
     parser.add_argument(
@@ -700,9 +700,12 @@ def build_targeted_scenario_prompt(
         "- Generate the situation only; do not include label_action or preference_snapshot.\n"
         "- The situation must stay plausible for the human profile and the given time.\n"
         "- Use context flags only when needed to justify the target label.\n"
-        "- For do_later/no_action/remind, create real reasons in the context rather "
-        "than simply saying the robot should not act.\n"
-        "- Keep the action concrete and domestic/assistive.\n"
+        "- For do_later/no_action/tell_the_user, create real reasons in the context "
+        "rather than simply saying the robot should not act.\n"
+        "- action_text MUST be a concrete domestic task that both a human and a robot "
+        "could physically perform (e.g. 'make breakfast', 'give medication to user', "
+        "'vacuum the living room'). It must NOT describe the robot's response or "
+        "framing (NOT 'offer to...', 'remind the user to...', 'suggest...').\n"
         "- Do not invent medical emergencies unless the target requires a high-risk "
         "case and the profile/context supports it.\n\n"
         "Return JSON:\n"
@@ -741,20 +744,20 @@ def build_targeted_decision_prompt(
         "Allowed labels:\n"
         "- do_now: robot should execute/help now.\n"
         "- do_later: robot should postpone the action.\n"
-        "- remind: robot should remind or notify, not execute directly.\n"
+        "- tell_the_user: robot should tell or ask the user, not execute directly.\n"
         "- no_action: robot should stay passive.\n\n"
         "Rules:\n"
         "- preference_snapshot must be a subset of the stable preferences unless "
         "there is direct profile evidence in the summary.\n"
         "- Include at most 5 preference_snapshot items.\n"
         "- Do not create new context conditions.\n"
-        "- For avoid_* signals, polarity should usually be 'prefer' when the user "
-        "prefers that avoidance rule.\n"
+        "- Each preference_snapshot item keeps the polarity and weight (1-10) it had "
+        "in the stable preferences.\n"
         "- Copy signal_name values exactly.\n\n"
         "Return JSON:\n"
         "{\n"
-        '  "preference_snapshot": [{"signal_name": "...", "polarity": "prefer|avoid"}],\n'
-        '  "label_action": "do_now|do_later|remind|no_action",\n'
+        '  "preference_snapshot": [{"signal_name": "...", "polarity": "prefer|avoid", "weight": 7}],\n'
+        '  "label_action": "do_now|do_later|tell_the_user|no_action",\n'
         '  "decision_rationale": "...",\n'
         '  "target_label_consistency": "matched|mismatched",\n'
         '  "consistency_checks": ["..."]\n'

@@ -12,8 +12,30 @@ from coopera_profile_loader import (
     load_mypersonality_profiles,
     resolve_mypersonality_path,
 )
-from preference_taxonomy import PREFERENCE_SIGNALS, VALID_LABELS
+from preference_taxonomy import (
+    PREFERENCE_SIGNALS,
+    SIGNAL_SEMANTICS,
+    VALID_LABELS,
+    signal_subcategory,
+)
 from qwen_labeler import QwenDecisionLabeler
+
+
+# Default preference weight (1-10) used when Qwen omits it for an item.
+DEFAULT_PREFERENCE_WEIGHT = 5.0
+
+
+def taxonomy_signal_block() -> str:
+    """Render the 12 signals with their prefer/avoid meaning for Qwen prompts."""
+    lines: list[str] = []
+    for signal in sorted(PREFERENCE_SIGNALS):
+        semantics = SIGNAL_SEMANTICS.get(signal, {})
+        lines.append(
+            f"- {signal}: {semantics.get('description', '')} "
+            f"prefer(high) => {semantics.get('prefer_means', '')} "
+            f"avoid(high) => {semantics.get('avoid_means', '')}"
+        )
+    return "\n".join(lines)
 
 
 DEFAULT_TIMES = [
@@ -628,9 +650,11 @@ def build_profile_summary_prompt(profile_context: dict[str, Any]) -> str:
     }
     return (
         "Summarize this COOPERA human profile for later synthetic simulation.\n"
-        "Focus on stable personality implications: social style, routine style, "
-        "autonomy/control, intrusiveness tolerance, reminder style, likely support "
-        "domains, and uncertainty. Do not create concrete robot tasks yet.\n\n"
+        "Focus on stable personality implications relevant to how an assistive "
+        "robot should behave: tolerance for robot initiative and autonomous "
+        "execution, desire to keep control, action immediacy vs routine adherence, "
+        "sensitivity to interruption and context, need for prompting/explanation, "
+        "and attitude to safety/risk. Do not create concrete robot tasks yet.\n\n"
         "Use cautious language. Big Five values around 2.5-3.5 are moderate, not low "
         "or high. Do not make clinical claims or strong claims that are not directly "
         "supported by the profile.\n\n"
@@ -653,26 +677,29 @@ def build_preference_profile_prompt(
     }
     return (
         "Infer a stable assistive-robot preference profile for this human.\n\n"
+        "The taxonomy has 12 behavioral preference signals. Each preference is "
+        "expressed with a polarity (prefer or avoid) and a weight from 1 to 10 "
+        "(how strongly this person holds it). Signal names never contain 'prefer' "
+        "or 'avoid' - polarity is a separate field.\n\n"
+        "Signals and their meaning:\n"
+        f"{taxonomy_signal_block()}\n\n"
         "Rules:\n"
         "- Use ONLY evidence from the profile summary and Big Five.\n"
         "- Do NOT infer preferences from a hypothetical current task or time.\n"
-        "- For signals whose name starts with avoid_, use polarity='prefer' when "
-        "the human prefers that avoidance rule.\n"
-        "- Copy signal_name values exactly from the allowed list. Do not create "
-        "variants such as prefer_prefer_* or avoid_avoid_*.\n"
+        "- Only assign signals clearly supported by the Big Five profile; not all "
+        "12 need to be present.\n"
+        "- Copy signal_name values exactly from the allowed list.\n"
+        "- polarity is 'prefer' or 'avoid'; weight is an integer 1-10.\n"
+        "- rationale is a one-sentence justification grounded in the personality traits.\n"
         "- Return at most 8 stable_preferences.\n"
-        "- Omit weak or unsupported preferences.\n"
-        "- Put unsupported options in uncertain_or_omitted instead of guessing.\n"
-        "- Do not infer time-of-day preferences, support domains, voice/text mode, "
-        "or data-sharing preferences unless the profile explicitly supports them.\n"
-        "- Avoid contradictory preference axes. For example, do not prefer both "
-        "strict and flexible routine, both proactive and on-demand reminders, or "
-        "both detailed and brief messages.\n\n"
+        "- Omit weak or unsupported preferences; put them in uncertain_or_omitted.\n"
+        "- Do not assign two signals from the same subcategory with opposite "
+        "polarities (no contradictions on the same axis).\n\n"
         "Allowed signal_name values:\n"
         f"{json.dumps(allowed, ensure_ascii=False)}\n\n"
         "Return JSON:\n"
         "{\n"
-        '  "stable_preferences": [{"signal_name": "...", "polarity": "prefer|avoid"}],\n'
+        '  "stable_preferences": [{"signal_name": "...", "polarity": "prefer|avoid", "weight": 7, "rationale": "..."}],\n'
         '  "profile_level_rationale": "...",\n'
         '  "uncertain_or_omitted": ["..."]\n'
         "}\n\n"
@@ -693,6 +720,11 @@ def build_scenario_prompt(
         "Generate assistive-robot decision situations for this simulated human.\n\n"
         "Rules:\n"
         "- Generate plausible situations, not preference labels.\n"
+        "- action_text MUST be a concrete domestic task that both a human and a "
+        "robot could physically perform (e.g. 'make breakfast', 'give medication "
+        "to user', 'vacuum the living room', 'water the plants'). It must NOT "
+        "describe the robot's response or framing (NOT 'offer to...', 'remind the "
+        "user to...', 'suggest...'). The robot's decision is predicted separately.\n"
         "- Do NOT include preference_snapshot or label_action here.\n"
         "- Do NOT introduce strong context flags such as user_asleep, guests_present, "
         "adverse_weather, quiet_hours, or user_in_rush unless the profile summary "
@@ -726,22 +758,26 @@ def build_decision_reflection_prompt(
     return (
         "Reflect on the robot decision for this scenario.\n\n"
         "Rules:\n"
-        "- Choose label_action from: do_now, do_later, remind, no_action.\n"
+        "- Choose label_action from: do_now, do_later, tell_the_user, no_action.\n"
+        "  - do_now: robot should execute/help now.\n"
+        "  - do_later: robot should postpone the action.\n"
+        "  - tell_the_user: robot should tell or ask the user rather than executing.\n"
+        "  - no_action: robot should stay passive.\n"
         "- preference_snapshot must be a subset of the stable preferences unless "
         "there is direct profile evidence in the summary.\n"
         "- Do not create new context conditions.\n"
-        "- For avoid_* signals, polarity should usually be 'prefer' when the user "
-        "prefers that avoidance rule.\n"
+        "- Each preference_snapshot item keeps the polarity and weight (1-10) it "
+        "had in the stable preferences.\n"
         "- Copy signal_name values exactly from the stable preferences or allowed "
-        "taxonomy. Do not add extra prefixes.\n"
+        "taxonomy.\n"
         "- Include at most 5 preference_snapshot items, only those directly relevant "
         "to the scenario decision.\n"
         "- If the scenario conflicts with the profile or lacks enough evidence, "
-        "prefer conservative labels such as remind or no_action.\n\n"
+        "prefer conservative labels such as tell_the_user or no_action.\n\n"
         "Return JSON:\n"
         "{\n"
-        '  "preference_snapshot": [{"signal_name": "...", "polarity": "prefer|avoid"}],\n'
-        '  "label_action": "do_now|do_later|remind|no_action",\n'
+        '  "preference_snapshot": [{"signal_name": "...", "polarity": "prefer|avoid", "weight": 7}],\n'
+        '  "label_action": "do_now|do_later|tell_the_user|no_action",\n'
         '  "decision_rationale": "...",\n'
         '  "consistency_checks": ["..."]\n'
         "}\n\n"
@@ -855,10 +891,10 @@ def normalize_structured_features(value: Any) -> dict[str, Any]:
     }
 
 
-def validate_snapshot(value: Any) -> list[dict[str, str]]:
+def validate_snapshot(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise ValueError("preference_snapshot must be a list.")
-    out: list[dict[str, str]] = []
+    out: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in value:
         if not isinstance(item, dict):
@@ -869,22 +905,39 @@ def validate_snapshot(value: Any) -> list[dict[str, str]]:
             raise ValueError(f"Unknown preference signal: {signal!r}")
         if polarity not in {"prefer", "avoid"}:
             raise ValueError(f"Invalid polarity for {signal!r}: {polarity!r}")
-        if signal.startswith("avoid_") and polarity == "avoid":
-            polarity = "prefer"
         if signal in seen:
             continue
         seen.add(signal)
-        out.append({"signal_name": signal, "polarity": polarity})
+        row: dict[str, Any] = {
+            "signal_name": signal,
+            "polarity": polarity,
+            "weight": coerce_weight(item.get("weight")),
+        }
+        rationale = str(item.get("rationale", "")).strip()
+        if rationale:
+            row["rationale"] = rationale
+        out.append(row)
     return out
 
 
+def coerce_weight(value: Any) -> float:
+    """Parse a preference weight into [1, 10], defaulting when missing/invalid."""
+    if value is None or value == "":
+        return DEFAULT_PREFERENCE_WEIGHT
+    try:
+        weight = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_PREFERENCE_WEIGHT
+    return max(1.0, min(10.0, weight))
+
+
 def compact_snapshot(
-    snapshot: list[dict[str, str]],
+    snapshot: list[dict[str, Any]],
     *,
     max_items: int,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     """Keep the training signal focused when Qwen over-selects taxonomy entries."""
-    compact: list[dict[str, str]] = []
+    compact: list[dict[str, Any]] = []
     used_axes: set[str] = set()
     for item in snapshot:
         axis = preference_axis(item["signal_name"])
@@ -898,66 +951,15 @@ def compact_snapshot(
 
 
 def preference_axis(signal: str) -> str:
-    axes = {
-        "tone": {"prefer_formal_tone", "prefer_friendly_tone"},
-        "message_length": {"prefer_brief_messages", "prefer_detailed_messages"},
-        "confirmation": {
-            "prefer_confirmation_before_action",
-            "prefer_no_confirmation_for_low_risk",
-        },
-        "interaction_mode": {"prefer_voice_interaction", "prefer_text_interaction"},
-        "control": {
-            "prefer_high_robot_autonomy",
-            "prefer_shared_control",
-            "prefer_user_final_decision",
-            "prefer_manual_override_always",
-        },
-        "time_of_day": {
-            "prefer_morning_tasks",
-            "prefer_afternoon_tasks",
-            "prefer_evening_tasks",
-        },
-        "routine": {"prefer_strict_routine", "prefer_flexible_routine"},
-        "reminder_timing": {"prefer_proactive_reminders", "prefer_on_demand_reminders"},
-        "risk_policy": {
-            "prefer_conservative_risk_policy",
-            "prefer_fast_action_under_risk",
-        },
-        "execution_style": {
-            "prefer_step_by_step_guidance",
-            "prefer_do_it_for_me",
-            "prefer_coaching_not_execution",
-        },
-        "proactivity": {
-            "prefer_non_intrusive_assistance",
-            "prefer_proactive_assistance",
-        },
-        "explanation": {
-            "prefer_explain_why_decision",
-            "prefer_explain_alternatives",
-            "prefer_no_explanation",
-        },
-    }
-    for axis, signals in axes.items():
-        if signal in signals:
-            return axis
-    return signal
+    """Preference axis for a signal = its taxonomy subcategory (e.g. 'control')."""
+    return signal_subcategory(signal) or signal
 
 
 def canonical_signal_name(signal: str) -> str:
-    """Repair common LLM near-misses while keeping the taxonomy closed."""
-    candidates = [signal]
-    if signal.startswith("prefer_prefer_"):
-        candidates.append(signal.replace("prefer_prefer_", "prefer_", 1))
-    if signal.startswith("avoid_avoid_"):
-        candidates.append(signal.replace("avoid_avoid_", "avoid_", 1))
-    if signal.startswith("prefer_avoid_"):
-        candidates.append(signal.replace("prefer_avoid_", "avoid_", 1))
-    if signal.startswith("avoid_prefer_"):
-        candidates.append(signal.replace("avoid_prefer_", "prefer_", 1))
-    for candidate in candidates:
-        if candidate in PREFERENCE_SIGNALS:
-            return candidate
+    """Normalize an LLM-provided signal name against the closed taxonomy."""
+    normalized = signal.strip().lower()
+    if normalized in PREFERENCE_SIGNALS:
+        return normalized
     return signal
 
 

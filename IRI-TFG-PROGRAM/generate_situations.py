@@ -33,26 +33,29 @@ from human_sim_preference_data import (
     normalize_action_input,
     normalize_context_input,
     normalize_structured_features,
-    write_jsonl,
 )
-from preference_taxonomy import PREFERENCE_SIGNALS, VALID_LABELS
+from preference_taxonomy import (
+    PREFERENCE_SIGNALS,
+    SIGNAL_SEMANTICS,
+    describe_signal_semantics,
+    differentiating_labels_for,
+)
 from qwen_labeler import QwenDecisionLabeler
 
 
-# Morning / afternoon / evening keeps time-sensitive signals (quiet hours,
-# nighttime notifications, time-of-day preferences) meaningful without exploding
+# Morning / afternoon / evening keeps time-sensitive signals (context
+# sensitivity, interruption sensitivity, immediacy) meaningful without exploding
 # the grid the way v1's 13 hourly slots would.
 DEFAULT_SITUATION_TIMES = ["9 am", "2 pm", "9 pm"]
 
-# Used when neither --signals nor --all-signals is given. These are exactly the
-# five worked examples in the design brief, so a no-arg run produces a useful,
-# diverse starter set.
+# Used when neither --signals nor --all-signals is given. A diverse starter set
+# spanning several subcategories of the new taxonomy.
 DEFAULT_SIGNALS = [
-    "prefer_confirmation_before_action",
-    "avoid_interrupt_during_quiet_hours",
-    "prefer_proactive_assistance",
-    "prefer_on_demand_reminders",
-    "prefer_high_robot_autonomy",
+    "autonomous_execution",
+    "user_control",
+    "action_immediacy",
+    "interruption_sensitivity",
+    "user_prompting",
 ]
 
 
@@ -77,7 +80,7 @@ def parse_args() -> argparse.Namespace:
     selection.add_argument(
         "--all-signals",
         action="store_true",
-        help="Use the whole taxonomy (all 50 signals).",
+        help="Use the whole taxonomy (all 12 signals).",
     )
 
     parser.add_argument(
@@ -166,6 +169,11 @@ def main() -> None:
         total_profiles=len(signals),
         total_samples=total_situations,
     )
+    # Stream each situation to disk as it is generated.
+    writer = IncrementalSituationWriter(
+        output=args.output,
+        output_dir=args.output_dir.resolve(),
+    )
     progress.start()
 
     try:
@@ -195,6 +203,7 @@ def main() -> None:
                     )
                     situation = {"situation_id": situation_id, **situation}
                     situations_by_signal[signal].append(situation)
+                    writer.write(signal, situation)
                     progress.sample(label=signal)
                 except Exception as exc:
                     errors.append(
@@ -215,15 +224,11 @@ def main() -> None:
     finally:
         progress.close()
         generator.close()
+        writer.close()
 
-    written = write_situations(
-        situations_by_signal=situations_by_signal,
-        output=args.output,
-        output_dir=args.output_dir.resolve(),
-    )
     print_situations_summary(
         situations_by_signal=situations_by_signal,
-        written=written,
+        written=writer.paths,
         errors=errors,
     )
 
@@ -254,6 +259,7 @@ def generate_situation(
     time_text: str,
     variant: int,
 ) -> dict[str, Any]:
+    differentiating_labels = differentiating_labels_for(signal, "prefer")
     payload, _ = generator.generate_json(
         system=(
             "You design domestic assistive-robot situations anchored to a single "
@@ -262,13 +268,11 @@ def generate_situation(
         user=build_situation_prompt(
             signal=signal,
             signal_description=signal_description,
+            differentiating_labels=differentiating_labels,
             day=day,
             time_text=time_text,
             variant=variant,
         ),
-    )
-    differentiating_labels = validate_differentiating_labels(
-        payload.get("differentiating_labels")
     )
     return {
         "anchored_signal": signal,
@@ -290,45 +294,52 @@ def build_situation_prompt(
     *,
     signal: str,
     signal_description: str,
+    differentiating_labels: list[str],
     day: str,
     time_text: str,
     variant: int,
 ) -> str:
-    allowed_labels = json.dumps(sorted(VALID_LABELS))
+    semantics = SIGNAL_SEMANTICS.get(signal, {})
+    label_if_has, label_if_not = differentiating_labels[0], differentiating_labels[1]
+    context_hint = signal_context_hint(signal)
     return (
         "Design ONE domestic assistive-robot situation for a synthetic dataset.\n\n"
         f"Anchored preference signal: {signal}\n"
-        f"Meaning (inferred from the name): {signal_description}\n\n"
-        "Goal: build a situation where THIS signal is the decisive lever. The "
-        "robot's best action must change depending on whether the user has this "
-        "preference or not. A user WITH the signal and a user WITHOUT it should "
-        "lead to two DIFFERENT label_action outcomes for the very same situation.\n\n"
-        "First infer the two labels this signal differentiates between, chosen "
-        f"from: {allowed_labels}.\n"
-        "Examples of how a signal can differentiate two labels (do NOT copy "
-        "blindly; infer from the actual signal above):\n"
-        "- prefer_confirmation_before_action -> remind vs do_now\n"
-        "- avoid_interrupt_during_quiet_hours -> no_action vs do_now\n"
-        "- prefer_proactive_assistance -> do_now vs do_later\n"
-        "- prefer_on_demand_reminders -> no_action vs remind\n"
-        "- prefer_high_robot_autonomy -> do_now vs remind\n\n"
+        f"Meaning: {signal_description}\n"
+        f"- prefer (high) means: {semantics.get('prefer_means', '')}\n"
+        f"- avoid (high) means: {semantics.get('avoid_means', '')}\n\n"
+        "Goal: build a situation where THIS signal is the decisive lever. For the "
+        "very same situation, the robot's best decision should be "
+        f"'{label_if_has}' for a user who strongly holds this preference and "
+        f"'{label_if_not}' for a user who does not.\n\n"
+        "CRITICAL constraint on action_text:\n"
+        "- action_text MUST be a CONCRETE domestic task that both a human and a "
+        "robot could physically perform (a chore, a care task, or a daily-living "
+        "activity). Examples: 'make breakfast', 'give medication to user', "
+        "'vacuum the living room', 'clean the table', 'wash dishes', 'take out the "
+        "trash', 'water the plants', 'prepare coffee', 'fold laundry'.\n"
+        "- It must NOT describe the robot's response or framing. WRONG: 'offer to "
+        "make breakfast', 'suggest the user takes medication', 'remind user to "
+        "clean'. The robot's decision (do it now, tell the user, wait, etc.) is "
+        "predicted separately and must not be baked into the action.\n\n"
         "Rules:\n"
         "- The situation must be domestic and assistive (home, daily living).\n"
         "- It must be plausible and natural, never forced or contrived.\n"
         "- Keep it AGNOSTIC to any personality: describe the world, not the user's "
         "preferences. The same situation is shown to everyone; only the anchored "
         "signal decides the outcome.\n"
-        "- Do NOT include label_action or preference_snapshot.\n"
+        "- Shape the context (time_of_day, user_state, environment_flags, etc.) so "
+        f"the signal makes a meaningful difference. {context_hint}\n"
+        "- Do NOT include label_action, differentiating_labels, or preference_snapshot.\n"
         "- Anchor the situation to the given day and time.\n"
-        "- scenario_rationale MUST state which two labels differ and why this "
-        "signal is what flips the decision between them.\n\n"
+        "- scenario_rationale MUST explain why this signal flips the decision "
+        f"between '{label_if_has}' and '{label_if_not}'.\n\n"
         "Return JSON:\n"
         "{\n"
-        '  "differentiating_labels": ["<label_if_user_has_signal>", "<label_if_not>"],\n'
         '  "action_input": {"action_text": "...", "activity": "..."},\n'
         '  "context_input": {"location_current": "...", "objects_nearby": [], "available_objects": [], "raw_conditions": [], "time_of_day": "...", "weekday": "synthetic_day_XX", "user_state": [], "environment_flags": []},\n'
         '  "structured_task_features": {"kind": "...", "urgency": "low|medium|high", "sensitivity": "low|medium|high", "user_busy": false, "quiet_hours": false, "conditions": [], "context_flags": {}},\n'
-        '  "scenario_rationale": "which two labels differ and why this signal is the lever"\n'
+        '  "scenario_rationale": "why this signal is the lever between the two labels"\n'
         "}\n\n"
         f"Day: {day}\n"
         f"Time: {time_text}\n"
@@ -336,32 +347,29 @@ def build_situation_prompt(
     )
 
 
+# Per-signal hint nudging the context toward where the signal would matter.
+_SIGNAL_CONTEXT_HINTS: dict[str, str] = {
+    "interruption_sensitivity": "For example set user_state=['focused'] or environment_flags=['guests_present'].",
+    "context_sensitivity": "For example use a nighttime time_of_day or user_state=['tired'].",
+    "routine_adherence": "For example make the task fall inside or outside the user's usual routine slot.",
+    "action_immediacy": "For example make the task something that could equally be done now or later.",
+    "safety_priority": "For example introduce a mild safety concern (a spill, a hot stove left on).",
+    "risk_caution": "For example make the action uncertain, sensitive, or potentially annoying.",
+    "user_control": "For example make the task one a user might reasonably want to decide on themselves.",
+    "user_prompting": "For example make the task something the user could easily do if told.",
+    "autonomous_execution": "For example make the task safely automatable without supervision.",
+    "robot_initiative": "For example leave the need unspoken so initiative is what differs.",
+    "explanation_need": "For example make the action non-obvious so an explanation would help.",
+}
+
+
+def signal_context_hint(signal: str) -> str:
+    return _SIGNAL_CONTEXT_HINTS.get(signal, "")
+
+
 def describe_signal(signal: str) -> str:
-    """Human-readable gloss inferred purely from the signal name."""
-    if signal.startswith("avoid_"):
-        body = signal[len("avoid_"):].replace("_", " ")
-        return f"the user prefers to avoid {body}"
-    if signal.startswith("prefer_"):
-        body = signal[len("prefer_"):].replace("_", " ")
-        return f"the user prefers {body}"
-    return signal.replace("_", " ")
-
-
-def validate_differentiating_labels(value: Any) -> list[str]:
-    if not isinstance(value, list):
-        raise ValueError("differentiating_labels must be a list.")
-    labels: list[str] = []
-    for item in value:
-        label = str(item).strip()
-        if label not in VALID_LABELS:
-            raise ValueError(f"Invalid differentiating label: {label!r}")
-        if label not in labels:
-            labels.append(label)
-    if len(labels) != 2:
-        raise ValueError(
-            f"differentiating_labels must contain exactly 2 distinct labels, got {labels}"
-        )
-    return labels
+    """Human-readable gloss for a signal, sourced from the taxonomy semantics."""
+    return describe_signal_semantics(signal)
 
 
 def compact_time(text: str) -> str:
@@ -369,28 +377,48 @@ def compact_time(text: str) -> str:
     return "".join(str(text).lower().split())
 
 
-def write_situations(
-    *,
-    situations_by_signal: dict[str, list[dict[str, Any]]],
-    output: Path | None,
-    output_dir: Path,
-) -> list[Path]:
-    if output is not None:
-        all_situations = [
-            situation
-            for situations in situations_by_signal.values()
-            for situation in situations
-        ]
-        write_jsonl(output, all_situations)
-        return [output]
+class IncrementalSituationWriter:
+    """Streams situations to disk as they are generated, one JSONL line each.
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    written: list[Path] = []
-    for signal, situations in situations_by_signal.items():
-        path = output_dir / f"situations_{signal}.jsonl"
-        write_jsonl(path, situations)
-        written.append(path)
-    return written
+    Combined mode (``output`` set): a single JSONL with every situation.
+    Per-signal mode (``output_dir``): one ``situations_<signal>.jsonl`` per
+    signal, opened lazily on the first situation for that signal (so signals
+    that produce nothing create no file, matching the previous batch behavior).
+    Every line is flushed so the file can be tailed and an interrupt keeps all
+    situations produced so far.
+    """
+
+    def __init__(self, *, output: Path | None, output_dir: Path) -> None:
+        self.output = output
+        self.output_dir = output_dir
+        self.paths: list[Path] = []
+        self._combined: Any = None
+        self._per_signal: dict[str, Any] = {}
+        if output is not None:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            self._combined = output.open("w", encoding="utf-8")
+            self.paths.append(output)
+        else:
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+    def write(self, signal: str, situation: dict[str, Any]) -> None:
+        if self._combined is not None:
+            handle = self._combined
+        else:
+            handle = self._per_signal.get(signal)
+            if handle is None:
+                path = self.output_dir / f"situations_{signal}.jsonl"
+                handle = path.open("w", encoding="utf-8")
+                self._per_signal[signal] = handle
+                self.paths.append(path)
+        handle.write(json.dumps(situation, ensure_ascii=False) + "\n")
+        handle.flush()
+
+    def close(self) -> None:
+        if self._combined is not None:
+            self._combined.close()
+        for handle in self._per_signal.values():
+            handle.close()
 
 
 def print_situations_plan(plan: dict[str, Any]) -> None:

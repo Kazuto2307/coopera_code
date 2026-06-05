@@ -462,13 +462,13 @@ def infer_label_action_rules_debug(
     if features.get("kind") == "safety":
         return "do_now"
     if "remind" in text and "prefer_proactive_reminders" in signals:
-        return "remind"
+        return "tell_the_user"
     if features.get("user_busy") and "prefer_assistance_when_user_busy" in signals:
         return "do_now"
     if activity in {"meal support", "housekeeping", "mobility support"}:
         return "do_now"
     if activity == "cognitive or leisure support":
-        return "remind"
+        return "tell_the_user"
     return "do_now"
 
 

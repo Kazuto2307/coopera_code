@@ -35,7 +35,6 @@ from human_sim_preference_data import (
     ProgressDisplay,
     build_sample_from_stages,
     summarize,
-    write_jsonl,
 )
 from human_sim_preference_data_v2_balanced import (
     LABEL_ORDER,
@@ -100,7 +99,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional JSON dict of label weights, e.g. "
-            "'{\"do_now\": 0.25, \"do_later\": 0.25, \"remind\": 0.25, \"no_action\": 0.25}'."
+            "'{\"do_now\": 0.25, \"do_later\": 0.25, \"tell_the_user\": 0.25, \"no_action\": 0.25}'."
         ),
     )
     parser.add_argument(
@@ -214,6 +213,11 @@ def main() -> None:
         total_profiles=len(profiles),
         total_samples=len(label_schedule),
     )
+
+    # Stream each accepted sample to disk as soon as it is produced, so the JSONL
+    # grows live and an interrupt keeps everything generated so far.
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    output_handle = args.output.open("w", encoding="utf-8")
     progress.start()
 
     try:
@@ -250,6 +254,8 @@ def main() -> None:
 
             actual_label = sample["label_action"]
             samples.append(sample)
+            output_handle.write(json.dumps(sample, ensure_ascii=False) + "\n")
+            output_handle.flush()
             accepted_counts[actual_label] += 1
             if actual_label != target_label:
                 mismatch_counts[f"{target_label}->{actual_label}"] += 1
@@ -266,8 +272,8 @@ def main() -> None:
     finally:
         progress.close()
         generator.close()
+        output_handle.close()
 
-    write_jsonl(args.output, samples)
     summary = summarize(samples=samples, errors=errors, args=args, plan=plan)
     summary["target_label_counts"] = dict(label_targets)
     summary["accepted_label_counts"] = dict(accepted_counts)

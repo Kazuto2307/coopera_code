@@ -7,7 +7,10 @@ import os
 import re
 from typing import Any
 
-from preference_taxonomy import PREFERENCE_SIGNALS, VALID_LABELS
+from preference_taxonomy import PREFERENCE_SIGNALS, SIGNAL_SEMANTICS, VALID_LABELS
+
+
+DEFAULT_PREFERENCE_WEIGHT = 5.0
 
 
 class QwenDecisionLabeler:
@@ -250,30 +253,37 @@ def _build_profile_grounded_prompt(
         "coopera_act": sample.get("source_metadata", {}).get("coopera_act"),
     }
     allowed_signals = sorted(PREFERENCE_SIGNALS)
+    signal_block = "\n".join(
+        f"- {signal}: {SIGNAL_SEMANTICS.get(signal, {}).get('description', '')} "
+        f"prefer(high) => {SIGNAL_SEMANTICS.get(signal, {}).get('prefer_means', '')} "
+        f"avoid(high) => {SIGNAL_SEMANTICS.get(signal, {}).get('avoid_means', '')}"
+        for signal in allowed_signals
+    )
     return (
         "You are generating synthetic training supervision for an assistive-robot "
         "personalization model.\n\n"
         "IMPORTANT: Do NOT infer personal preferences merely from the current task "
-        "or time. For example, a breakfast task at 9 am does NOT imply the person "
-        "prefers morning tasks. Preferences must be grounded in the provided "
-        "COOPERA human profile, Big Five/personality summary, and the profile's "
-        "behavioral rationale. If the profile does not support a preference, omit it.\n\n"
+        "or time. Preferences must be grounded in the provided COOPERA human "
+        "profile, Big Five/personality summary, and the profile's behavioral "
+        "rationale. If the profile does not support a preference, omit it.\n\n"
         "Your job:\n"
-        "1. Select zero or more preference signals that this simulated human would "
-        "likely have, grounded in the profile.\n"
+        "1. Select zero or more behavioral preference signals that this simulated "
+        "human would likely have, grounded in the profile. Each has a polarity "
+        "(prefer or avoid) and a weight from 1 to 10 (how strongly it is held).\n"
         "2. Choose what the assistive robot should do in this situation for this "
         "specific human.\n\n"
-        "Allowed label_action values: do_now, do_later, remind, no_action.\n"
+        "Allowed label_action values: do_now, do_later, tell_the_user, no_action.\n"
         "Use these meanings:\n"
         "- do_now: robot should execute/help now.\n"
         "- do_later: robot should postpone the action.\n"
-        "- remind: robot should remind or notify, not execute directly.\n"
+        "- tell_the_user: robot should tell or ask the user, not execute directly.\n"
         "- no_action: robot should stay passive.\n\n"
-        "Allowed preference signal_name values:\n"
-        f"{json.dumps(allowed_signals, ensure_ascii=False)}\n\n"
+        "Preference signals and their meaning:\n"
+        f"{signal_block}\n\n"
         "Return exactly one JSON object with keys:\n"
-        "- preference_snapshot: list of {signal_name, polarity}; polarity is prefer or avoid.\n"
-        "- Copy signal_name values exactly from the allowed list. Do not create variants like prefer_prefer_*.\n"
+        "- preference_snapshot: list of {signal_name, polarity, weight}; polarity is "
+        "prefer or avoid, weight is an integer 1-10.\n"
+        "- Copy signal_name values exactly from the list above.\n"
         "- label_action: one allowed label.\n"
         "- rationale: short explanation grounded in the profile.\n\n"
         "COOPERA HUMAN PROFILE CONTEXT:\n"
@@ -345,40 +355,38 @@ def _extract_balanced_json_object(text: str) -> str | None:
     return None
 
 
-def _validate_preference_snapshot(value: Any) -> list[dict[str, str]]:
+def _validate_preference_snapshot(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise ValueError("Qwen response preference_snapshot must be a list.")
-    out: list[dict[str, str]] = []
+    out: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in value:
         if not isinstance(item, dict):
             continue
-        signal = _canonical_signal_name(str(item.get("signal_name", "")).strip())
+        signal = str(item.get("signal_name", "")).strip().lower()
         polarity = str(item.get("polarity", "prefer")).strip().lower()
         if signal not in PREFERENCE_SIGNALS:
             raise ValueError(f"Qwen returned unknown preference signal: {signal!r}")
         if polarity not in {"prefer", "avoid"}:
             raise ValueError(f"Qwen returned invalid polarity for {signal!r}: {polarity!r}")
-        if signal.startswith("avoid_") and polarity == "avoid":
-            polarity = "prefer"
         if signal in seen:
             continue
         seen.add(signal)
-        out.append({"signal_name": signal, "polarity": polarity})
+        out.append(
+            {
+                "signal_name": signal,
+                "polarity": polarity,
+                "weight": _coerce_weight(item.get("weight")),
+            }
+        )
     return out
 
 
-def _canonical_signal_name(signal: str) -> str:
-    candidates = [signal]
-    if signal.startswith("prefer_prefer_"):
-        candidates.append(signal.replace("prefer_prefer_", "prefer_", 1))
-    if signal.startswith("avoid_avoid_"):
-        candidates.append(signal.replace("avoid_avoid_", "avoid_", 1))
-    if signal.startswith("prefer_avoid_"):
-        candidates.append(signal.replace("prefer_avoid_", "avoid_", 1))
-    if signal.startswith("avoid_prefer_"):
-        candidates.append(signal.replace("avoid_prefer_", "prefer_", 1))
-    for candidate in candidates:
-        if candidate in PREFERENCE_SIGNALS:
-            return candidate
-    return signal
+def _coerce_weight(value: Any) -> float:
+    if value is None or value == "":
+        return DEFAULT_PREFERENCE_WEIGHT
+    try:
+        weight = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_PREFERENCE_WEIGHT
+    return max(1.0, min(10.0, weight))

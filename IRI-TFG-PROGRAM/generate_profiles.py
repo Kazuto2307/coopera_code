@@ -274,9 +274,10 @@ def build_profile_description_prompt(
     return (
         "Write exactly ONE short, human-readable sentence (max ~30 words) that "
         "describes this synthetic human for an assistive-robot study.\n\n"
-        "When supported by the evidence, mention their interaction style, whether "
-        "their routine is strict or flexible, and the assistance domain they would "
-        "most value (meals, medication, housekeeping, mobility, social, cognitive).\n\n"
+        "When supported by the evidence, mention how much robot initiative and "
+        "autonomous execution they tolerate, how much control they want to keep, "
+        "their sensitivity to interruption/context, and their attitude to safety "
+        "and risk.\n\n"
         "Rules:\n"
         "- Base the sentence ONLY on the profile summary and stable preferences below.\n"
         "- Do not invent demographic facts (age, gender, diagnosis) that are not present.\n"

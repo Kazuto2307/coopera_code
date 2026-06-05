@@ -68,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-samples", type=int, default=3000)
     parser.add_argument(
         "--label-weights", default=None,
-        help='JSON dict, e.g. \'{"do_now": 0.25, "do_later": 0.25, "remind": 0.25, "no_action": 0.25}\'',
+        help='JSON dict, e.g. \'{"do_now": 0.25, "do_later": 0.25, "tell_the_user": 0.25, "no_action": 0.25}\'',
     )
     parser.add_argument("--max-attempts-per-sample", type=int, default=3)
     parser.add_argument("--accept-mismatch-if-useful", action="store_true", default=True)
