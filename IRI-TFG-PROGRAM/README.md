@@ -1,458 +1,137 @@
 # IRI-TFG-PROGRAM
 
-Modulo aislado para generar datos sinteticos de entrenamiento del repositorio
-de preferencias a partir de planes humanos generados por COOPERA.
+Generacion de datos sinteticos de entrenamiento para un modelo de personalizacion
+de decisiones de un robot asistencial: dado un humano (perfil de personalidad) y
+una situacion domestica con una accion propuesta del robot, predecir que querria
+la persona que hiciera el robot.
 
-La separacion es esta:
+- **Labels de decision**: `do_now`, `do_later`, `tell_the_user`, `no_action`.
+- **Taxonomia de preferencias**: 11 senales jerarquicas (con `prefer`/`avoid` y
+  `weight` 1-10) en `preference_taxonomy.py`.
+- **LLM**: Qwen local (`qwen_labeler.py`, GPU; torch lazy). En local sin CUDA se
+  prueba con `--dry-run` o stubs.
 
-- COOPERA genera perfiles humanos, Big Five, resumen de personalidad,
-  intenciones y tareas domesticas.
-- Este modulo parsea los planes finales de COOPERA.
-- Qwen local genera `preference_snapshot` y `label_action` usando el perfil
-  humano de COOPERA, no reglas superficiales del contexto.
-- Los JSONL sinteticos se guardan en `generated_data/`.
+> Nota de estructura: los scripts estan en plano (mismo directorio) porque se
+> importan entre si por nombre (`from human_sim_preference_data import ...`), que
+> solo resuelve si comparten carpeta. Se ejecutan como
+> `python IRI-TFG-PROGRAM/<script>.py` (ese dir queda en `sys.path[0]`).
 
-No ejecuta Habitat ni renderiza videos.
+---
 
-## Entrada COOPERA
+## Pipelines
 
-Lee planes finales como:
+Hay tres pipelines. Todos comparten el **paso 1 (perfiles)** y la **traduccion a
+accion de robot**.
 
-```text
-results/human/gpt_response/collaboration_1/predicates_reflection_2/<human>/<scene>/<day>/<hour>/predicates_reflection_2.json
-```
-
-Y carga contexto de personalidad desde:
-
-```text
-results/human/gpt_response/traits_summary/<human>/<timestamp>/traits_summary.json
-data/humanoids/humanoid_data/mypersonality_final.csv
-```
-
-El nombre `gpt_response` es historico en COOPERA. En este fork puede estar
-respaldado por Qwen local.
-
-## Salida
-
-Genera muestras con el contrato del repositorio de preferencias:
-
-```json
-{
-  "sample_id": "coopera:00003:108736635_177263256:00:...:task1",
-  "user_id": 4,
-  "user_external_id": "coopera_human_00003",
-  "label_action": "do_now",
-  "action_input": {
-    "action_text": "place 008_pudding_box_:0000 on Food, White Pedestal Bowl",
-    "activity": "meal support"
-  },
-  "context_input": {
-    "location_current": "kitchen",
-    "objects_nearby": ["Food, White Pedestal Bowl", "008_pudding_box_:0000"],
-    "available_objects": ["008_pudding_box_:0000", "Food, White Pedestal Bowl"],
-    "raw_conditions": ["cozy", "user nearby"],
-    "time_of_day": "morning",
-    "weekday": "synthetic_day_00",
-    "user_state": ["nearby"],
-    "environment_flags": []
-  },
-  "structured_task_features": {
-    "kind": "routine_reminder",
-    "urgency": "medium",
-    "sensitivity": "low",
-    "user_busy": false,
-    "quiet_hours": false,
-    "conditions": ["user nearby"],
-    "context_flags": {}
-  },
-  "preference_snapshot": [
-    {"signal_name": "prefer_non_intrusive_assistance", "polarity": "prefer"}
-  ]
-}
-```
-
-Importante: `preference_snapshot` y `label_action` salen del modo
-`qwen_profile`, que recibe el perfil, Big Five/resumen e intencion/tarea. No se
-deben inferir por reglas como "desayuno -> prefer_morning_tasks".
-
-## Uso recomendado con Qwen perfil
-
-Desde la raiz de COOPERA:
+### Paso 1 (comun): perfiles
+`generate_profiles.py` — lee `mypersonality_final.csv` (+ traits opcional) y
+genera por humano: `profile_summary`, `preference_profile` (taxonomia nueva:
+`{signal_name, polarity, weight}`) y una `description`. Salida:
+`generated_data/profiles/human_XXXXX.json`.
 
 ```bash
-python IRI-TFG-PROGRAM/build_training_data_from_coopera.py \
-  --response-source gpt_response \
-  --collab-type 1 \
-  --generation-strategy qwen_profile \
-  --qwen-model Qwen/Qwen3-VL-8B-Instruct-FP8 \
-  --output IRI-TFG-PROGRAM/generated_data/training_samples_from_coopera_qwen_profile.jsonl \
-  --summary-output IRI-TFG-PROGRAM/generated_data/training_samples_from_coopera_qwen_profile_summary.json
+python IRI-TFG-PROGRAM/generate_profiles.py --num-profiles 25
 ```
 
-## Pipeline conectado y controlable
+### Pipeline A — dataset-grounded libre (principal)
+Situaciones reales de Charades (EPIC opcional), traducidas a accion de robot, y
+decision LIBRE (sin forzar labels, sin anchoring).
 
-Para lanzar `human_sim.py` y despues construir el JSONL en una sola orden:
+```
+build_situations_from_external.py   (CPU)  -> situaciones (accion humana)
+translate_situations.py             (GPU)  -> accion de robot
+generate_training_data.py           (GPU)  -> JSONL de entrenamiento (decision libre)
+```
+Orquestador: `run_pipeline.py` (perfiles -> build -> translate -> training;
+`--skip-*`, `--sample N` para pruebas).
 
 ```bash
-python IRI-TFG-PROGRAM/run_controlled_pipeline.py \
-  --scene-indices 1 \
-  --profile-indices 3 \
-  --max-days 1 \
-  --collab-type 1 \
-  --generation-strategy qwen_profile \
-  --output IRI-TFG-PROGRAM/generated_data/training_samples_scene1_human3_day0.jsonl
+python IRI-TFG-PROGRAM/run_pipeline.py --num-profiles 25 --target-samples 3000 \
+  --output IRI-TFG-PROGRAM/generated_data/preference_training.jsonl
 ```
 
-Esto ejecuta dos etapas:
+### Pipeline B — horario minimo (nuevo)
+Como A pero cada situacion se expande a **24 copias (una por hora)** y la
+estructura es **minima**: `structured_task_features = {kind, quiet_hours}` (se
+omiten urgency/sensitivity/user_busy/conditions/context_flags). Sin invencion por
+LLM en el build.
 
-1. `habitat-lab/coopera_main/human_sim/human_sim.py`, que genera
-   `traits_summary` y `predicates_reflection_2`.
-2. `IRI-TFG-PROGRAM/build_training_data_from_coopera.py`, que convierte esos
-   planes en JSONL para el modelo de preferencias.
-
-Para solo ver los comandos sin ejecutar Habitat/Qwen:
+```
+build_situations_hourly.py          (CPU)  -> situaciones minimas x24h
+translate_situations.py             (GPU)  -> accion de robot
+generate_training_data_hourly.py    (GPU)  -> JSONL (muestras minimas)
+```
 
 ```bash
-python IRI-TFG-PROGRAM/run_controlled_pipeline.py \
-  --scene-indices 1 \
-  --profile-indices 3 \
-  --max-days 1 \
-  --dry-run
-```
-
-Para reutilizar planes ya generados y reconstruir solo el dataset:
-
-```bash
-python IRI-TFG-PROGRAM/run_controlled_pipeline.py \
-  --scene-indices 1 \
-  --profile-indices 3 \
-  --max-days 1 \
-  --skip-human-sim \
-  --generation-strategy qwen_profile
-```
-
-El pipeline guarda un `*.manifest.json` junto al JSONL con los comandos usados.
-
-## Human Sim Alternativo Para Tu Dataset
-
-Si no quieres generar primero `predicates_reflection_2` para el simulador, usa:
-
-```bash
-python IRI-TFG-PROGRAM/human_sim_preference_data.py \
-  --profile-indices 3 \
-  --max-days 1 \
-  --samples-per-hour 1 \
-  --output IRI-TFG-PROGRAM/generated_data/preference_human_sim_human3_day0.jsonl
-```
-
-El script busca `mypersonality_final.csv` en estas rutas:
-
-```text
-data/humanoids/humanoid_data/mypersonality_final.csv
-habitat-lab/data/versioned_data/habitat_humanoids/mypersonality_final.csv
-```
-
-Si esta en otra ruta:
-
-```bash
-python IRI-TFG-PROGRAM/human_sim_preference_data.py \
-  --mypersonality-path /ruta/a/mypersonality_final.csv \
-  --profile-indices 3 \
-  --max-days 1
-```
-
-Este script es el equivalente conceptual de `human_sim.py`, pero su salida no es
-para Habitat. En vez de generar planes con `Act: [...]`, genera directamente
-muestras del modelo de preferencias:
-
-```text
-COOPERA mypersonality + Big Five + traits_summary opcional
-        |
-        v
-profile_summary
-        |
-        v
-preference_profile estable
-        |
-        v
-assistance_situation por hora
-        |
-        v
-decision_reflection
-        |
-        v
-action_input + context_input + structured_task_features
-        |
-        v
-preference_snapshot + label_action
-        |
-        v
-JSONL listo para entrenamiento
-```
-
-Para comprobar bucles sin cargar Qwen:
-
-```bash
-python IRI-TFG-PROGRAM/human_sim_preference_data.py \
-  --profile-indices 3 \
-  --max-days 1 \
-  --dry-run
-```
-
-Durante una ejecucion real, el script muestra un resumen visual del plan y
-barras de progreso para perfiles y muestras si `tqdm` esta instalado. Si no lo
-esta, usa mensajes simples de progreso. Para desactivar las barras:
-
-```bash
-python IRI-TFG-PROGRAM/human_sim_preference_data.py \
-  --max-profiles 20 \
-  --max-days 5 \
-  --samples-per-hour 1 \
-  --no-progress
-```
-
-Si quieres conservar tambien el plan completo en JSON por terminal:
-
-```bash
---plan-json
-```
-
-Este es el camino mas directo si tu objetivo es dataset, no simulacion fisica.
-
-La estructura imita COOPERA: no se pide a Qwen que genere todo de golpe. Primero
-compacta la persona, despues infiere preferencias estables, despues propone una
-situacion, y finalmente reflexiona la decision del robot. Los intermedios se
-guardan en:
-
-```text
-IRI-TFG-PROGRAM/generated_data/<run>_intermediate/<human_id>/
-  profile_summary.json
-  preference_profile.json
-```
-
-Para una prueba pequena en servidor:
-
-```bash
-python IRI-TFG-PROGRAM/build_training_data_from_coopera.py \
-  --response-source gpt_response \
-  --collab-type 1 \
-  --generation-strategy qwen_profile \
-  --human-ids 3 \
-  --days 0 \
-  --max-files 2 \
-  --output IRI-TFG-PROGRAM/generated_data/smoke_qwen_profile.jsonl
-```
-
-Si falta el perfil de COOPERA, el script falla por defecto. Eso es intencional:
-evita generar preferencias sin personalidad humana. Solo para depuracion puedes
-relajar esto con:
-
-```bash
---allow-missing-profile
-```
-
-Si el modelo requiere token:
-
-```bash
-export HUGGINGFACE_TOKEN=...
-```
-
-## Modo de depuracion sin Qwen
-
-Existe `rules_debug` solo para comprobar parser/rutas sin cargar GPU:
-
-```bash
-python IRI-TFG-PROGRAM/build_training_data_from_coopera.py \
-  --response-source gpt_response \
-  --collab-type 1 \
-  --generation-strategy rules_debug \
-  --max-files 2 \
-  --output IRI-TFG-PROGRAM/generated_data/debug_rules.jsonl
-```
-
-No usar `rules_debug` como dataset final.
-
-## Pipeline de datos (situaciones del dataset, sin anchoring)
-
-El flujo NO inventa situaciones ni las ancla a ninguna preferencia: las
-situaciones salen de datasets publicos de actividades domesticas (EPIC-Kitchens
-+ Charades), se traducen a acciones de robot, y el humano sintetico decide
-libremente que querria que hiciera el robot, sin forzar ninguna etiqueta.
-
-1. `generate_profiles.py`              -> humanos sinteticos (perfil + preferencias + description).
-2. `build_situations_from_external.py` -> parsea EPIC+Charades a situaciones crudas (CPU).
-   `translate_situations.py`           -> traduce cada accion humana a accion de robot (Qwen/GPU).
-3. `generate_training_data.py`         -> decision libre: el humano elige label sin forzar nada (Qwen/GPU).
-
-Etiquetas (taxonomia nueva): `do_now`, `do_later`, `tell_the_user`, `no_action`.
-Todos aceptan `--dry-run` (plan sin cargar Qwen) y `--no-progress`.
-
-```text
-generate_profiles.py        build_situations_from_external.py
-  (humanos sinteticos)        (EPIC + Charades -> situaciones)
-        |                             |
-        |                     translate_situations.py
-        |                       (accion humana -> accion de robot)
-        +-------------+---------------+
-                      v
-            generate_training_data.py
-          (decision libre, sin forzar labels)
-                      |
-                      v
-        JSONL de entrenamiento (distribucion natural)
-```
-
-`run_pipeline.py` encadena los cuatro pasos en una sola orden.
-
-### Paso 1: perfiles
-
-Lee `mypersonality_final.csv` y, si existe, el `traits_summary` de COOPERA.
-Para cada perfil genera con Qwen un `profile_summary`, un `preference_profile`
-estable y una `description` legible de una frase. Guarda un JSON por humano.
-
-```bash
-python IRI-TFG-PROGRAM/generate_profiles.py \
-  --num-profiles 10 \
-  --output-dir IRI-TFG-PROGRAM/generated_data/profiles/
-```
-
-O con indices explicitos:
-
-```bash
-python IRI-TFG-PROGRAM/generate_profiles.py \
-  --profile-indices 0 3 7 \
-  --output-dir IRI-TFG-PROGRAM/generated_data/profiles/
-```
-
-Cada humano se persiste como `generated_data/profiles/human_XXXXX.json`:
-
-```json
-{
-  "human_id": "00003",
-  "profile_index": 3,
-  "big_five": {"openness": 3.1, "conscientiousness": 3.4, "extroversion": 2.6, "agreeableness": 3.8, "neuroticism": 2.9},
-  "profile_summary": {"summary": {}, "source": "generated_from_mypersonality"},
-  "preference_profile": {
-    "stable_preferences": [{"signal_name": "interruption_sensitivity", "polarity": "prefer"}],
-    "profile_level_rationale": "...",
-    "uncertain_or_omitted": []
-  },
-  "description": "Una frase legible que describe al humano sintetico.",
-  "generated_at": "2026-06-01T13:46:29+02:00"
-}
-```
-
-Sin `--overwrite`, los `human_XXXXX.json` ya existentes se saltan y se loguean.
-`--num-profiles` y `--profile-indices` son mutuamente excluyentes. Si la
-generacion de la `description` falla, queda `null` sin abortar el perfil.
-
-### Paso 2: situaciones (del dataset, traducidas a acciones de robot)
-
-Las situaciones NO se inventan ni se anclan: se construyen de datasets publicos
-de actividades de la vida diaria y luego se traducen a acciones de robot.
-
-`build_situations_from_external.py` parsea solo las anotaciones de texto (sin
-video). Por defecto usa **Charades** (~157 actividades domesticas en todas las
-habitaciones), y emite situaciones tal cual, sin anclaje a ninguna preferencia:
-
-```bash
-python IRI-TFG-PROGRAM/build_situations_from_external.py \
-  --output IRI-TFG-PROGRAM/generated_data/situations_external/external_situations.jsonl
-```
-
-EPIC-Kitchens-100 (cocina, ~77k acciones) sigue disponible pero esta desactivado
-por defecto; para incluirlo: `--sources epic charades`.
-
-(Las anotaciones crudas se descargan a `IRI-TFG-PROGRAM/external_datasets/raw/`.)
-
-Despues, `translate_situations.py` reescribe cada `action_text` (accion humana)
-como accion de robot con Qwen en GPU. Lo que el robot puede hacer se mantiene
-("make breakfast" -> "prepare breakfast") y lo que solo hace la persona se
-reformula como asistencia ("consume pills" -> "offer the pills"). Traduce solo
-frases unicas y cachea el mapa (`--reuse-map` para reanudar):
-
-```bash
+python IRI-TFG-PROGRAM/build_situations_hourly.py \
+  --output IRI-TFG-PROGRAM/generated_data/situations_hourly/situations_hourly.jsonl
 python IRI-TFG-PROGRAM/translate_situations.py \
-  --input  IRI-TFG-PROGRAM/generated_data/situations_external/external_situations.jsonl \
-  --output IRI-TFG-PROGRAM/generated_data/situations_external/external_situations_robot.jsonl
+  --input  IRI-TFG-PROGRAM/generated_data/situations_hourly/situations_hourly.jsonl \
+  --output IRI-TFG-PROGRAM/generated_data/situations_hourly/situations_hourly_robot.jsonl
+python IRI-TFG-PROGRAM/generate_training_data_hourly.py \
+  --situations IRI-TFG-PROGRAM/generated_data/situations_hourly/situations_hourly_robot.jsonl \
+  --target-samples 3000 --output IRI-TFG-PROGRAM/generated_data/preference_training_hourly.jsonl
 ```
+Charades son ~64k base x24 = ~1.5M situaciones: para pruebas usa
+`build_situations_hourly.py --max-per-source 200` o `--hours 8 14 22`.
 
-Cada situacion es una linea JSONL (sin anchoring, sin campos de usuario):
+### Pipeline V1 — anclado (CONGELADO)
+`pipeline_v1_anchored/` — copia autocontenida del pipeline anclado original
+(commit 748d6ae): taxonomia VIEJA (49 senales + `remind`), situaciones ancladas a
+una senal y training con balanceo/forzado de labels. Genero los datos de ~5k que
+se explican en la memoria del TFG. Trae sus propias copias de los modulos, asi
+que corre aislado del codigo nuevo. Ver `pipeline_v1_anchored/ABOUT_THIS_FOLDER.md`.
+No editar: es el registro historico V1.
 
-```json
-{
-  "situation_id": "ext:charades:46GP8:c129",
-  "source_dataset": "charades",
-  "action_input": {"action_text": "offer the pills", "activity": "medication support"},
-  "context_input": {"location_current": "bedroom", "objects_nearby": [], "time_of_day": "unknown", "weekday": "unknown", "user_state": []},
-  "structured_task_features": {"kind": "medication_support", "urgency": "medium", "sensitivity": "high"},
-  "scenario_rationale": "...",
-  "source_metadata": {"original_action_text": "taking/consuming some medicine", "source_dataset": "charades"}
-}
-```
+---
 
-### Paso 3: datos de entrenamiento (decision libre)
+## Mapa de ficheros
 
-Carga los perfiles del paso 1 y las situaciones traducidas del paso 2. Para cada
-par (humano, situacion), Qwen decide de forma natural que querria esa persona
-que hiciera el robot. NO hay label schedule, ni target label, ni reintentos para
-forzar una etiqueta, ni anclaje de preferencias: la distribucion de labels es la
-que emerja. Usa la taxonomia nueva (`tell_the_user` y las 11 senales jerarquicas
-con su semantica `prefer`/`avoid` inyectada en el prompt).
+### Modulos compartidos (librerias, no se ejecutan solos)
+| Fichero | Rol |
+|---|---|
+| `preference_taxonomy.py` | Taxonomia nueva: 11 senales, labels, SIGNAL_SEMANTICS, helpers. |
+| `qwen_labeler.py` | `QwenDecisionLabeler` (Qwen local, JSON). |
+| `coopera_profile_loader.py` | Carga mypersonality + traits. |
+| `human_sim_preference_data.py` | **v1 base**: normalizers, `build_sample_from_stages`, `summarize`, `ProgressDisplay`, etc. |
+| `human_sim_preference_data_v2_balanced.py` | **v2 base**: `routine_signature`, `register_routine`, etc. |
 
-```bash
-python IRI-TFG-PROGRAM/generate_training_data.py \
-  --profiles-dir IRI-TFG-PROGRAM/generated_data/profiles/ \
-  --situations   IRI-TFG-PROGRAM/generated_data/situations_external/external_situations_robot.jsonl \
-  --target-samples 3000 \
-  --output IRI-TFG-PROGRAM/generated_data/preference_training.jsonl \
-  --summary-output IRI-TFG-PROGRAM/generated_data/preference_training_summary.json
-```
+### Pipeline A (dataset-grounded libre)
+`build_situations_from_external.py`, `translate_situations.py`,
+`generate_training_data.py`, `run_pipeline.py`.
 
-El `sample_id` es `synth:<human_id>:<situation_id>:<n>` y el `source_metadata`
-incluye `human_id`, `situation_id`, `source_dataset`, `original_action_text` y
-`decision_rationale`. `--routine-consistency enforce` (opcional, por defecto
-`off`) descarta contradicciones (misma situacion para el mismo humano con label
-distinto) sin forzar ninguna etiqueta. Con `--profile-indices` se usa un
-subconjunto de perfiles.
+### Pipeline B (horario minimo)
+`build_situations_hourly.py`, `generate_training_data_hourly.py`
+(+ `translate_situations.py` compartido).
 
-### Todo en una sola orden
+### Comun
+`generate_profiles.py`.
 
-`run_pipeline.py` encadena perfiles -> build -> translate -> training:
+### Herramientas
+| Fichero | Rol |
+|---|---|
+| `study_situations.py` | EDA de un JSONL de situaciones (distribuciones, redundancia, diagnostico, plots). |
+| `demo_situations_pipeline.py` | Muestra ejemplos RAW -> situacion -> accion de robot. |
 
-```bash
-python IRI-TFG-PROGRAM/run_pipeline.py \
-  --num-profiles 25 \
-  --target-samples 3000 \
-  --output IRI-TFG-PROGRAM/generated_data/preference_training_3k.jsonl \
-  --summary-output IRI-TFG-PROGRAM/generated_data/preference_training_3k_summary.json
-```
+### Legacy COOPERA (planes de Habitat; no usado por los pipelines actuales)
+`build_training_data_from_coopera.py`, `coopera_plan_parser.py`,
+`run_controlled_pipeline.py`, `example_pipeline_config.json`.
 
-Pasos saltables: `--skip-profiles`, `--skip-build`, `--skip-translate`,
-`--skip-training`. Anade `--dry-run` para ver el plan sin cargar Qwen.
+### Carpetas
+| Carpeta | Contenido |
+|---|---|
+| `external_datasets/raw/` | Anotaciones crudas (Charades, EPIC) — solo texto, sin video. |
+| `generated_data/` | Salidas (perfiles, situaciones, JSONL, study). **Gitignored.** |
+| `pipeline_v1_anchored/` | Pipeline V1 anclado congelado (ver arriba). |
 
-## Entrenar en el repo de preferencias
+---
 
-```bash
-python -m src.scripts.training.train_decision_personalization_model \
-  --input path/to/training_samples_from_coopera_qwen_profile.jsonl \
-  --model-output artifacts/decision_personalization/model_coopera.pt \
-  --report-output artifacts/decision_personalization/report_coopera.json
-```
+## Datasets fuente
+- **Charades** (por defecto): Sigurdsson et al., ECCV 2016. Actividades
+  domesticas en toda la casa. `arXiv:1604.01753`.
+- **EPIC-Kitchens-100** (opcional, `--sources epic charades`): Damen et al.,
+  IJCV 2022. Cocina egocentrica. `arXiv:2006.13256`.
 
-## Archivos
-
-- `coopera_plan_parser.py`: parser compatible con `predicates_reflection_2.json`.
-- `coopera_profile_loader.py`: carga `traits_summary` y Big Five/perfil original.
-- `build_training_data_from_coopera.py`: genera JSONL de entrenamiento.
-- `human_sim_preference_data.py`: genera JSONL directamente desde perfiles humanos (v1, funciones base).
-- `human_sim_preference_data_v2_balanced.py`: variante v2 con balanceo de label, routine consistency y reintentos.
-- `generate_profiles.py`: paso 1, genera humanos sinteticos (perfil + preferencias + description).
-- `build_situations_from_external.py`: paso 2a, parsea EPIC-Kitchens + Charades a situaciones (CPU, sin anchoring).
-- `translate_situations.py`: paso 2b, traduce las acciones humanas a acciones de robot con Qwen.
-- `generate_training_data.py`: paso 3, decision libre del humano sintetico (sin forzar labels), taxonomia nueva.
-- `run_pipeline.py`: encadena los cuatro pasos en una sola orden.
-- `external_datasets/raw/`: anotaciones crudas descargadas (EPIC, Charades).
-- `qwen_labeler.py`: genera preferencias y target con Qwen local, sin OpenAI.
-- `preference_taxonomy.py`: senales cerradas esperadas por el RAG entrenable.
-- `generated_data/`: salida sintetica.
+## Pruebas sin GPU
+Todos los scripts aceptan `--dry-run` (muestran el plan sin cargar Qwen). El
+build y el study corren en CPU.

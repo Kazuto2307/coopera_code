@@ -1,0 +1,19 @@
+{
+  "description": "Example command settings for the controlled COOPERA -> preference dataset pipeline.",
+  "command": [
+    "python",
+    "IRI-TFG-PROGRAM/run_controlled_pipeline.py",
+    "--scene-indices",
+    "1",
+    "--profile-indices",
+    "3",
+    "--max-days",
+    "1",
+    "--collab-type",
+    "1",
+    "--generation-strategy",
+    "qwen_profile",
+    "--output",
+    "IRI-TFG-PROGRAM/generated_data/training_samples_scene1_human3_day0.jsonl"
+  ]
+}
