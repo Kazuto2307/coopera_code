@@ -352,15 +352,16 @@ Las situaciones NO se inventan ni se anclan: se construyen de datasets publicos
 de actividades de la vida diaria y luego se traducen a acciones de robot.
 
 `build_situations_from_external.py` parsea solo las anotaciones de texto (sin
-video) de EPIC-Kitchens-100 (cocina, ~77k acciones verbo+objeto) y Charades
-(~157 actividades domesticas en todas las habitaciones), y emite situaciones tal
-cual, sin anclaje a ninguna preferencia:
+video). Por defecto usa **Charades** (~157 actividades domesticas en todas las
+habitaciones), y emite situaciones tal cual, sin anclaje a ninguna preferencia:
 
 ```bash
 python IRI-TFG-PROGRAM/build_situations_from_external.py \
-  --sources epic charades \
   --output IRI-TFG-PROGRAM/generated_data/situations_external/external_situations.jsonl
 ```
+
+EPIC-Kitchens-100 (cocina, ~77k acciones) sigue disponible pero esta desactivado
+por defecto; para incluirlo: `--sources epic charades`.
 
 (Las anotaciones crudas se descargan a `IRI-TFG-PROGRAM/external_datasets/raw/`.)
 

@@ -365,7 +365,8 @@ def parse_args() -> argparse.Namespace:
         "--sources",
         nargs="+",
         choices=["epic", "charades"],
-        default=["epic", "charades"],
+        default=["charades"],
+        help="Datasets to include (default: charades only; add 'epic' for EPIC-Kitchens).",
     )
     parser.add_argument("--epic-splits", nargs="+", default=["train", "validation"])
     parser.add_argument("--charades-splits", nargs="+", default=["train", "test"])

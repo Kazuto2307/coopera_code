@@ -37,6 +37,8 @@ DEFAULT_RAW = PROGRAM_DIR / "external_datasets" / "raw"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Demo the situation-generation pipeline on a few examples.")
     parser.add_argument("--raw-dir", type=Path, default=DEFAULT_RAW)
+    parser.add_argument("--sources", nargs="+", choices=["epic", "charades"], default=["charades"],
+                        help="Datasets to demo (default: charades only).")
     parser.add_argument("--per-source", type=int, default=4, help="Examples to show per dataset.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--pool-cap", type=int, default=4000, help="How many rows to sample examples from.")
@@ -141,13 +143,15 @@ def main() -> None:
     print(f"Translate   : {args.translate}")
 
     examples: list[dict[str, Any]] = []
-    epic_pool = collect(iter_epic(epic_dir, ["train"]), args.pool_cap)
-    if epic_pool:
-        examples += pick_diverse(epic_pool, args.per_source, rng)
-    classes = load_charades_classes(charades_dir / "Charades_v1_classes.txt")
-    charades_pool = collect(iter_charades(charades_dir, ["train"], classes), args.pool_cap)
-    if charades_pool:
-        examples += pick_diverse(charades_pool, args.per_source, rng)
+    if "epic" in args.sources:
+        epic_pool = collect(iter_epic(epic_dir, ["train"]), args.pool_cap)
+        if epic_pool:
+            examples += pick_diverse(epic_pool, args.per_source, rng)
+    if "charades" in args.sources:
+        classes = load_charades_classes(charades_dir / "Charades_v1_classes.txt")
+        charades_pool = collect(iter_charades(charades_dir, ["train"], classes), args.pool_cap)
+        if charades_pool:
+            examples += pick_diverse(charades_pool, args.per_source, rng)
 
     if not examples:
         raise FileNotFoundError(

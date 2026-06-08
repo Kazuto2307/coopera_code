@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite-profiles", action="store_true")
 
     # Step 2a: build situations from datasets
-    parser.add_argument("--sources", nargs="+", choices=["epic", "charades"], default=["epic", "charades"])
+    parser.add_argument("--sources", nargs="+", choices=["epic", "charades"], default=["charades"])
     parser.add_argument("--max-per-source", type=int, default=None)
     parser.add_argument("--situations-raw", type=Path, default=DEFAULT_SITU_RAW)
 
