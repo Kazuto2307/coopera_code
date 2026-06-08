@@ -6,10 +6,10 @@ profile, generates a stable ``profile_summary`` and ``preference_profile`` with
 local Qwen. It then asks Qwen for one extra human-readable ``description`` and
 persists everything as a single JSON file per human under ``--output-dir``.
 
-The heavy lifting reuses the v1 pipeline functions
-(``get_or_generate_profile_summary`` / ``generate_preference_profile`` and their
-prompt builders) so the two scripts stay in sync. Nothing here loads Qwen when
-``--dry-run`` is set.
+The ``profile_summary`` reuses v1's taxonomy-agnostic summary stage; the
+``preference_profile`` is generated here against the NEW hierarchical taxonomy
+(11 signals + prefer/avoid polarity + weight 1-10, with SIGNAL_SEMANTICS injected
+into the prompt). Nothing here loads Qwen when ``--dry-run`` is set.
 
 Downstream, ``generate_training_data.py`` consumes these profile JSON files.
 """
@@ -28,14 +28,18 @@ from coopera_profile_loader import (
     resolve_mypersonality_path,
 )
 
-# get_or_generate_profile_summary / generate_preference_profile call
-# build_profile_summary_prompt / build_preference_profile_prompt internally, so
-# importing the two high-level stages transitively reuses the v1 prompt builders.
+# get_or_generate_profile_summary is taxonomy-agnostic (it only summarizes the
+# Big Five / personality), so it is reused as-is from v1. The preference profile
+# is generated locally below, against the NEW hierarchical taxonomy.
 from human_sim_preference_data import (
     ProgressDisplay,
-    generate_preference_profile,
     get_or_generate_profile_summary,
     select_profile_indices,
+)
+from preference_taxonomy import (
+    PREFERENCE_SIGNALS,
+    TAXONOMY,
+    describe_signal_semantics,
 )
 from qwen_labeler import QwenDecisionLabeler
 
@@ -234,6 +238,116 @@ def main() -> None:
         skipped=skipped,
         errors=errors,
     )
+
+
+def generate_preference_profile(
+    *,
+    generator: QwenDecisionLabeler,
+    profile_summary: dict[str, Any],
+    profile_context: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Infer stable preferences over the NEW hierarchical taxonomy.
+
+    Local to this script (not v1's old prefer_/avoid_ prompt). Each stable
+    preference is {signal_name, polarity (prefer|avoid), weight (1-10)}.
+    """
+    payload, meta = generator.generate_json(
+        system="You infer stable assistive-robot preferences. Return only valid JSON.",
+        user=build_preference_profile_prompt(
+            profile_summary=profile_summary,
+            profile_context=profile_context,
+        ),
+    )
+    stable_preferences = validate_preferences(payload.get("stable_preferences", []))
+    return (
+        {
+            "taxonomy_version": "hierarchical_v2",
+            "stable_preferences": stable_preferences,
+            "profile_level_rationale": payload.get("profile_level_rationale", ""),
+            "uncertain_or_omitted": payload.get("uncertain_or_omitted", []),
+        },
+        {"stage": "preference_profile", **meta},
+    )
+
+
+def build_preference_profile_prompt(
+    *,
+    profile_summary: dict[str, Any],
+    profile_context: dict[str, Any],
+) -> str:
+    compact = {
+        "human_id": profile_context.get("human_id"),
+        "profile_summary": profile_summary,
+        "big_five": (profile_context.get("mypersonality") or {}).get("big_five"),
+    }
+    return (
+        "Infer a stable assistive-robot preference profile for this human.\n\n"
+        "Each preference is ONE taxonomy signal with:\n"
+        "- polarity: 'prefer' = the person leans toward what the signal's "
+        "'prefer (high)' meaning describes; 'avoid' = leans the opposite way.\n"
+        "- weight: integer 1-10 = how strong and stable this is for the person.\n\n"
+        "Rules:\n"
+        "- Use ONLY evidence from the profile summary and Big Five.\n"
+        "- Do NOT infer preferences from any current task, time, or situation.\n"
+        "- Copy signal_name values EXACTLY from the list below.\n"
+        "- Keep only well-supported preferences (typically 3-7). Put weak or "
+        "unsupported ones in uncertain_or_omitted instead of guessing.\n"
+        "- Signals in the same [subcategory] are related axes; do not assert two "
+        "of them in strongly contradictory directions.\n\n"
+        "Allowed signals (meaning; [subcategory]):\n"
+        f"{signals_catalog()}\n\n"
+        "Return JSON:\n"
+        "{\n"
+        '  "stable_preferences": [{"signal_name": "...", "polarity": "prefer|avoid", "weight": 1-10}],\n'
+        '  "profile_level_rationale": "...",\n'
+        '  "uncertain_or_omitted": ["..."]\n'
+        "}\n\n"
+        f"HUMAN:\n{json.dumps(compact, ensure_ascii=False, indent=2)}"
+    )
+
+
+def signals_catalog() -> str:
+    lines: list[str] = []
+    for subcategories in TAXONOMY.values():
+        for subcategory, signals in subcategories.items():
+            for signal in signals:
+                lines.append(
+                    f"- {signal} [{subcategory}]: {describe_signal_semantics(signal)}"
+                )
+    return "\n".join(lines)
+
+
+def validate_preferences(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise ValueError("stable_preferences must be a list.")
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        signal = str(item.get("signal_name", "")).strip()
+        if signal not in PREFERENCE_SIGNALS or signal in seen:
+            continue
+        polarity = str(item.get("polarity", "prefer")).strip().lower()
+        if polarity not in {"prefer", "avoid"}:
+            polarity = "prefer"
+        seen.add(signal)
+        out.append({
+            "signal_name": signal,
+            "polarity": polarity,
+            "weight": _clamp_weight(item.get("weight")),
+        })
+        if len(out) >= 8:
+            break
+    return out
+
+
+def _clamp_weight(value: Any) -> int:
+    try:
+        weight = int(round(float(value)))
+    except (TypeError, ValueError):
+        return 5
+    return max(1, min(10, weight))
 
 
 def generate_profile_description(
