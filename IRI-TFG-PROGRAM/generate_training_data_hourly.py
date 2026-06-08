@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from generate_training_data import (
+    assemble_sample,
     load_profiles,
     load_situations,
     memory_entry,
@@ -34,7 +35,6 @@ from human_sim_preference_data import (
     ProgressDisplay,
     print_counter,
     summarize,
-    validate_snapshot,
 )
 from qwen_labeler import QwenDecisionLabeler
 
@@ -68,51 +68,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
-
-
-def build_minimal_sample(
-    *,
-    profile: dict[str, Any],
-    situation: dict[str, Any],
-    decision_payload: dict[str, Any],
-    index: int,
-) -> dict[str, Any]:
-    """Assemble the sample WITHOUT re-adding the dropped task-feature columns."""
-    human_id = str(profile.get("human_id"))
-    user_id = int(human_id) + 1 if human_id.isdigit() else index + 1
-    situation_id = str(situation.get("situation_id"))
-    snapshot = validate_snapshot(decision_payload.get("preference_snapshot", []))
-    return {
-        "sample_id": f"synth:{human_id}:{situation_id}:{index}",
-        "user_id": user_id,
-        "user_external_id": f"coopera_human_{human_id}",
-        "label_action": decision_payload["label_action"],
-        "action_input": situation.get("action_input"),
-        "context_input": situation.get("context_input"),
-        # Minimal: passed through as-is ({kind, quiet_hours}); NOT normalized/re-added.
-        "structured_task_features": situation.get("structured_task_features"),
-        "preference_snapshot": snapshot,
-        "source_metadata": {
-            "source": "preference_training_hourly_free_decision",
-            "human_id": human_id,
-            "profile_index": profile.get("profile_index"),
-            "situation_id": situation_id,
-            "source_dataset": situation.get("source_dataset"),
-            "hour": situation.get("hour"),
-            "time_text": situation.get("time_text"),
-            "original_action_text": (situation.get("source_metadata") or {}).get("original_action_text"),
-            "scenario_rationale": situation.get("scenario_rationale"),
-            "decision_rationale": decision_payload.get("decision_rationale"),
-            "stable_preference_profile": profile.get("preference_profile"),
-        },
-        "data_provenance": {
-            "action_input": "external_dataset_hourly_minimal_robot_action",
-            "context_input": "external_dataset_hourly_minimal",
-            "structured_task_features": "minimal_kind_quiet_hours_only",
-            "preference_snapshot": "synthetic_qwen_free_decision_new_taxonomy",
-            "label_action": "synthetic_qwen_free_decision_new_taxonomy",
-        },
-    }
 
 
 def main() -> None:
@@ -194,7 +149,7 @@ def main() -> None:
                     situation=situation,
                     memory=memory,
                 )
-                sample = build_minimal_sample(
+                sample = assemble_sample(
                     profile=profile,
                     situation=situation,
                     decision_payload=decision_payload,

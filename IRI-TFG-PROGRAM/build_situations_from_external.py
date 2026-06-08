@@ -174,27 +174,18 @@ def make_situation(
     scenario_rationale: str,
     source_metadata: dict[str, Any],
 ) -> dict[str, Any]:
-    context = normalize_context_input(
-        {
-            "location_current": location or None,
-            "objects_nearby": objects,
-            "available_objects": sorted(set(objects)),
-            "raw_conditions": [],
-            "time_of_day": "unknown",
-            "weekday": "unknown",
-            "user_state": user_state,
-            "environment_flags": [],
-        },
-        day="00",
-    )
     return {
         "situation_id": situation_id,
         "source_dataset": source_dataset,
         "action_input": normalize_action_input(
             {"action_text": action_text, "activity": activity}
         ),
-        "context_input": context,
-        "structured_task_features": features_for(activity),
+        # Slim context: only what the model conditions on.
+        "context_input": {
+            "location_current": location or "unknown",
+            "objects_nearby": [str(o).strip() for o in objects if str(o).strip()],
+            "user_state": list(user_state),
+        },
         "scenario_rationale": scenario_rationale.strip(),
         "source_metadata": source_metadata,
     }
@@ -237,10 +228,7 @@ def iter_epic(epic_dir: Path, splits: list[str]) -> Iterator[dict[str, Any]]:
                     location="kitchen",
                     objects=nouns,
                     user_state=[],
-                    scenario_rationale=(
-                        f"Kitchen activity '{narration}' ({verb}); a home robot could "
-                        "assist, remind, or stay passive depending on the user."
-                    ),
+                    scenario_rationale=f"Kitchen activity '{narration}' ({verb}).",
                     source_metadata={
                         "narration_id": row.get("narration_id"),
                         "video_id": row.get("video_id"),
@@ -325,11 +313,7 @@ def iter_charades(
                         location=normalize_scene(scene),
                         objects=objects,
                         user_state=infer_user_state(label),
-                        scenario_rationale=(
-                            (script or f"Home activity: {action_text}.")
-                            + " A home robot could assist, remind, or stay passive "
-                            "depending on the user."
-                        ),
+                        scenario_rationale=(script or f"Home activity: {action_text}."),
                         source_metadata={
                             "video_id": row.get("id"),
                             "scene": scene,
@@ -394,7 +378,7 @@ def dedup_key(situation: dict[str, Any]) -> tuple:
         action.get("action_text"),
         action.get("activity"),
         context.get("location_current"),
-        tuple(sorted(context.get("available_objects", []))),
+        tuple(sorted(context.get("objects_nearby", []))),
     )
 
 

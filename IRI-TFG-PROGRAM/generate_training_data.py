@@ -229,52 +229,70 @@ def build_one_sample(
     existing_count: int,
     index: int,
 ) -> dict[str, Any]:
-    human_id = str(profile.get("human_id"))
-    profile_summary = profile.get("profile_summary") or {}
-    preference_profile = profile.get("preference_profile") or {}
-    profile_context = {
-        "human_id": human_id,
-        "profile_index": profile.get("profile_index"),
-        "mypersonality": {"big_five": profile.get("big_five")},
-        "traits_summary": None,
-    }
-    situation_id = str(situation.get("situation_id"))
-
-    decision_payload, decision_meta = reflect_free_decision(
+    decision_payload, _ = reflect_free_decision(
         generator=generator,
-        profile_summary=profile_summary,
-        preference_profile=preference_profile,
+        profile_summary=profile.get("profile_summary") or {},
+        preference_profile=profile.get("preference_profile") or {},
         situation=situation,
         memory=memory,
     )
-    sample = build_sample_from_stages(
-        profile_context=profile_context,
-        profile_summary=profile_summary,
-        preference_profile=preference_profile,
-        scenario=situation,
-        scenario_metadata={
+    return assemble_sample(profile=profile, situation=situation,
+                           decision_payload=decision_payload, index=index)
+
+
+def assemble_sample(
+    *,
+    profile: dict[str, Any],
+    situation: dict[str, Any],
+    decision_payload: dict[str, Any],
+    index: int,
+) -> dict[str, Any]:
+    """Slim training sample (shared by both pipelines).
+
+    Inputs = action_input, context_input, preference_snapshot. The
+    `preference_snapshot` IS the profile's stable preferences (signal_name,
+    polarity, weight 1-10 from personality) — generated with the profile, not
+    with the label, so it can be a model input without leaking the answer. The
+    label generator produced only `label_action`. No structured_task_features.
+    """
+    human_id = str(profile.get("human_id"))
+    user_id = int(human_id) + 1 if human_id.isdigit() else index + 1
+    situation_id = str(situation.get("situation_id"))
+    stable_preferences = (profile.get("preference_profile") or {}).get("stable_preferences", [])
+    src = situation.get("source_metadata") or {}
+
+    context = dict(situation.get("context_input") or {})
+    if situation.get("hour") is not None:  # hourly pipeline: time = the hour
+        context["hour"] = situation.get("hour")
+
+    sample = {
+        "sample_id": f"synth:{human_id}:{situation_id}:{index}",
+        "user_id": user_id,
+        "user_external_id": f"coopera_human_{human_id}",
+        "label_action": decision_payload["label_action"],
+        "action_input": situation.get("action_input"),
+        "context_input": context,
+        "preference_snapshot": stable_preferences,
+        "source_metadata": {
+            "source": "preference_training_free_decision",
+            "human_id": human_id,
+            "profile_index": profile.get("profile_index"),
             "situation_id": situation_id,
             "source_dataset": situation.get("source_dataset"),
+            "hour": situation.get("hour"),
+            "time_text": situation.get("time_text"),
             "scenario_rationale": situation.get("scenario_rationale"),
+            "decision_rationale": decision_payload.get("decision_rationale"),
+            "original_action_text": src.get("original_action_text"),
         },
-        decision_payload=decision_payload,
-        decision_metadata=decision_meta,
-        day="na",
-        time_text="",
-        scenario_idx=1,
-        existing_count=existing_count,
-    )
-    sample["sample_id"] = f"synth:{human_id}:{situation_id}:{index}"
-    meta = sample["source_metadata"]
-    meta["source"] = "preference_training_free_decision"
-    meta["human_id"] = human_id
-    meta["situation_id"] = situation_id
-    meta["source_dataset"] = situation.get("source_dataset")
-    meta["original_action_text"] = (situation.get("source_metadata") or {}).get("original_action_text")
-    meta["decision_rationale"] = decision_payload.get("decision_rationale")
-    for key in ("action_input", "context_input", "structured_task_features"):
-        sample["data_provenance"][key] = "external_dataset_situation_robot_action"
-    meta["routine_signature"] = routine_signature(sample)
+        "data_provenance": {
+            "action_input": "dataset_situation_robot_action",
+            "context_input": "dataset_situation",
+            "preference_snapshot": "profile_stable_preferences",
+            "label_action": "qwen_free_decision",
+        },
+    }
+    sample["source_metadata"]["routine_signature"] = routine_signature(sample)
     return sample
 
 
@@ -318,26 +336,28 @@ def build_free_decision_prompt(
     situation: dict[str, Any],
     memory: list[dict[str, Any]],
 ) -> str:
+    # Show Qwen only the fields relevant to the decision.
+    context = situation.get("context_input") or {}
     situation_view = {
         "candidate_robot_action": situation.get("action_input"),
-        "context": situation.get("context_input"),
-        "task_features": situation.get("structured_task_features"),
+        "location": context.get("location_current"),
+        "objects_present": context.get("objects_nearby"),
+        "user_state": context.get("user_state"),
     }
+    if situation.get("time_text"):
+        situation_view["time"] = situation.get("time_text")
     return (
         "Decide what THIS specific person would want the home assistive robot to do "
         "in the situation below.\n\n"
         "Choose exactly ONE label_action:\n"
         f"{LABEL_MEANINGS}\n"
-        "Decide naturally, grounded in who this person is. Do NOT force any "
-        "particular outcome and do NOT assume the robot must help: if this person "
-        "would rather not be helped here, 'no_action' is the right answer.\n\n"
-        "Then list 0-5 preference signals that drove the decision, each with "
-        "polarity 'prefer' or 'avoid'. Use ONLY these signal names (copy exactly):\n"
-        f"{signals_block()}\n\n"
+        "Decide naturally, grounded in this person's profile and stable preferences "
+        "(each preference has a weight 1-10 = how strongly it holds). Do NOT force "
+        "any outcome and do NOT assume the robot must help: if this person would "
+        "rather not be helped here, 'no_action' is correct.\n\n"
         "Return JSON:\n"
         "{\n"
         '  "label_action": "do_now|do_later|tell_the_user|no_action",\n'
-        '  "preference_snapshot": [{"signal_name": "...", "polarity": "prefer|avoid"}],\n'
         '  "decision_rationale": "..."\n'
         "}\n\n"
         f"PERSON - profile summary:\n{json.dumps(profile_summary, ensure_ascii=False, indent=2)}\n\n"
@@ -348,10 +368,11 @@ def build_free_decision_prompt(
 
 
 def memory_entry(sample: dict[str, Any]) -> dict[str, Any]:
+    # Recent decision history for this person (the preference vector is constant
+    # per user, so it is not repeated here).
     return {
         "action_input": sample["action_input"],
         "label_action": sample["label_action"],
-        "preference_snapshot": sample["preference_snapshot"],
     }
 
 

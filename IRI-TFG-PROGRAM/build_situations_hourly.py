@@ -69,31 +69,19 @@ def domain_kind(activity: str) -> str:
 
 
 def expand_hour(base: dict[str, Any], hour: int) -> dict[str, Any]:
-    tod = time_of_day(hour)
     return {
         "situation_id": f"{base['base_id']}:h{hour:02d}",
         "source_dataset": base["source_dataset"],
-        "hour": hour,
+        "hour": hour,                       # the time signal (top-level)
         "time_text": hour_to_text(hour),
         "action_input": normalize_action_input(
             {"action_text": base["action_text"], "activity": base["activity"]}
         ),
-        "context_input": normalize_context_input(
-            {
-                "location_current": base["location"] or None,
-                "objects_nearby": base["objects"],
-                "available_objects": sorted(set(base["objects"])),
-                "time_of_day": tod,
-                "weekday": "synthetic_day",
-                "user_state": base["user_state"],
-            },
-            day="00",
-        ),
-        # Minimal: only kind + quiet_hours (both deterministic; no LLM, no heuristics
-        # for urgency/sensitivity/user_busy/conditions/context_flags).
-        "structured_task_features": {
-            "kind": domain_kind(base["activity"]),
-            "quiet_hours": tod == "night",
+        # Slim context: only what the model conditions on.
+        "context_input": {
+            "location_current": base["location"] or "unknown",
+            "objects_nearby": [str(o).strip() for o in base["objects"] if str(o).strip()],
+            "user_state": list(base["user_state"]),
         },
         "scenario_rationale": base["scenario_rationale"],
         "source_metadata": base["source_metadata"],
