@@ -58,6 +58,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--situations-robot", type=Path, default=DEFAULT_SITU_ROBOT)
     parser.add_argument("--batch-size", type=int, default=20)
     parser.add_argument("--reuse-map", action="store_true")
+    parser.add_argument(
+        "--sample",
+        type=int,
+        default=None,
+        help=(
+            "Quick test: translate only N RANDOM situations and train on those. "
+            "The robot situations go to a *_sampleN.jsonl file so the full dataset "
+            "is not overwritten. Use a small --target-samples too."
+        ),
+    )
 
     # Step 3: training data
     parser.add_argument("--target-samples", type=int, default=3000)
@@ -103,6 +113,14 @@ def main() -> None:
     if args.no_progress:
         shared += ["--no-progress"]
 
+    # When sampling for a quick test, route the translated situations to a
+    # sample-specific file so the full robot dataset is never overwritten.
+    robot_path = args.situations_robot
+    if args.sample is not None:
+        robot_path = robot_path.with_name(
+            f"{robot_path.stem}_sample{args.sample}{robot_path.suffix}"
+        )
+
     # Step 1: profiles
     if not args.skip_profiles:
         argv = [
@@ -139,11 +157,13 @@ def main() -> None:
     if not args.skip_translate:
         argv = [
             "--input", str(args.situations_raw),
-            "--output", str(args.situations_robot),
+            "--output", str(robot_path),
             "--batch-size", str(args.batch_size),
         ] + shared
         if args.reuse_map:
             argv += ["--reuse-map"]
+        if args.sample is not None:
+            argv += ["--sample", str(args.sample), "--seed", str(args.seed)]
         run_step("Step 2b - translate_situations", PROGRAM_DIR / "translate_situations.py", argv, args.dry_run)
     else:
         banner("Step 2b - translate_situations  [SKIPPED]")
@@ -152,7 +172,7 @@ def main() -> None:
     if not args.skip_training:
         argv = [
             "--profiles-dir", str(args.profiles_dir),
-            "--situations", str(args.situations_robot),
+            "--situations", str(robot_path),
             "--target-samples", str(args.target_samples),
             "--routine-consistency", args.routine_consistency,
             "--seed", str(args.seed),
