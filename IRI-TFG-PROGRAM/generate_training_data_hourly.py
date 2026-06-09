@@ -41,6 +41,50 @@ from qwen_labeler import QwenDecisionLabeler
 SITU_DIR = Path(__file__).resolve().parent / "generated_data" / "situations_hourly"
 DEFAULT_SITUATIONS = SITU_DIR / "situations_hourly_robot.jsonl"
 
+# How many random picks to try before giving up on finding a non-forbidden
+# (profile, situation) pair for a sample (sleep rule).
+SLEEP_MAX_TRIES = 25
+
+
+def _hour_in_window(hour: int, start: int, end: int) -> bool:
+    """True if `hour` is in the sleep window [start, end) on a 24h clock (wraps)."""
+    if start == end:
+        return False
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+
+def apply_sleep_rule(
+    profile: dict[str, Any], situation: dict[str, Any]
+) -> tuple[str, dict[str, Any]]:
+    """Apply the sleep rule for an (profile, hourly-situation) pair.
+
+    Returns (verdict, situation_to_use):
+    - "ok"        -> hour outside sleep (or no hour / no sleep_hours): use as-is.
+    - "asleep"    -> hour in sleep AND the action is robot-autonomous: a copy with
+                     context_input.user_state = ["asleep"].
+    - "forbidden" -> hour in sleep AND not robot-autonomous (needs the person, or
+                     unknown autonomy): the caller must resample.
+    """
+    hour = situation.get("hour")
+    sleep = profile.get("sleep_hours") or {}
+    try:
+        start = int(sleep["start"]) % 24
+        end = int(sleep["end"]) % 24
+    except (KeyError, TypeError, ValueError):
+        return "ok", situation
+    if hour is None or not _hour_in_window(int(hour), start, end):
+        return "ok", situation
+    if situation.get("robot_autonomous") is True:
+        asleep_sit = dict(situation)
+        asleep_sit["context_input"] = {
+            **(situation.get("context_input") or {}),
+            "user_state": ["asleep"],
+        }
+        return "asleep", asleep_sit
+    return "forbidden", situation
+
 
 def parse_args() -> argparse.Namespace:
     program_dir = Path(__file__).resolve().parent
@@ -119,6 +163,7 @@ def main() -> None:
     samples: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     memory_by_human: dict[str, list[dict[str, Any]]] = {}
+    sleep_counts: Counter[str] = Counter()
     seen_profiles: set[Any] = set()
     progress = ProgressDisplay(
         enabled=not args.no_progress,
@@ -132,12 +177,26 @@ def main() -> None:
     try:
         for index in range(args.target_samples):
             profile = profiles[index % len(profiles)]
-            situation = rng.choice(situations)
             human_id = str(profile.get("human_id"))
             if profile.get("profile_index") not in seen_profiles:
                 seen_profiles.add(profile.get("profile_index"))
                 progress.profile_start(human_id=human_id, profile_index=profile.get("profile_index"))
                 progress.profile_done()
+
+            # Sleep rule: forbidden pairs (asleep + non-autonomous action) are
+            # resampled; asleep + autonomous gets user_state = ["asleep"].
+            situation = None
+            verdict = "ok"
+            for _ in range(SLEEP_MAX_TRIES):
+                candidate = rng.choice(situations)
+                verdict, used = apply_sleep_rule(profile, candidate)
+                if verdict != "forbidden":
+                    situation = used
+                    break
+            if situation is None:
+                sleep_counts["forbidden_no_valid_situation"] += 1
+                continue
+            sleep_counts[verdict] += 1
 
             memory = memory_by_human.setdefault(human_id, [])
             progress.stage("free_decision", human_id=human_id, time_text=situation.get("time_text"))
@@ -162,6 +221,7 @@ def main() -> None:
                                message=f"{type(exc).__name__}: {exc}")
                 continue
 
+            sample["source_metadata"]["asleep"] = verdict == "asleep"
             samples.append(sample)
             output_handle.write(json.dumps(sample, ensure_ascii=False) + "\n")
             output_handle.flush()
@@ -176,6 +236,10 @@ def main() -> None:
     summary["label_distribution"] = dict(Counter(s["label_action"] for s in samples))
     summary["time_text_distribution"] = dict(
         Counter(s["source_metadata"].get("time_text") for s in samples)
+    )
+    summary["sleep_rule"] = dict(sleep_counts)
+    summary["asleep_samples"] = sum(
+        1 for s in samples if s["source_metadata"].get("asleep")
     )
     args.summary_output.parent.mkdir(parents=True, exist_ok=True)
     args.summary_output.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

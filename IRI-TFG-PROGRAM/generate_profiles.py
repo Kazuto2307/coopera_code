@@ -197,6 +197,12 @@ def main() -> None:
                     profile_summary=profile_summary,
                     preference_profile=preference_profile,
                 )
+                progress.stage("sleep_hours", human_id=human_id)
+                sleep_hours = generate_sleep_hours(
+                    generator=generator,
+                    profile_summary=profile_summary,
+                    big_five=profile.get("big_five"),
+                )
 
                 record = {
                     "human_id": human_id,
@@ -205,6 +211,7 @@ def main() -> None:
                     "profile_summary": profile_summary,
                     "preference_profile": preference_profile,
                     "description": description,
+                    "sleep_hours": sleep_hours,
                     "generated_at": datetime.now().astimezone().isoformat(
                         timespec="seconds"
                     ),
@@ -348,6 +355,63 @@ def _clamp_weight(value: Any) -> int:
     except (TypeError, ValueError):
         return 5
     return max(1, min(10, weight))
+
+
+DEFAULT_SLEEP_HOURS = {"start": 23, "end": 7}
+
+
+def generate_sleep_hours(
+    *,
+    generator: QwenDecisionLabeler,
+    profile_summary: dict[str, Any],
+    big_five: dict[str, Any] | None,
+) -> dict[str, int]:
+    """Infer a plausible nightly sleep window {start, end} (0-23, wraps midnight).
+
+    Used by the hourly pipeline: actions the user must do themselves are forbidden
+    during sleep, and autonomous robot actions during sleep get user_state=asleep.
+    Best-effort: any failure falls back to a sensible default.
+    """
+    try:
+        payload, _ = generator.generate_json(
+            system=(
+                "You infer a plausible nightly sleep schedule from personality. "
+                "Return only valid JSON."
+            ),
+            user=build_sleep_hours_prompt(profile_summary=profile_summary, big_five=big_five),
+        )
+        start = _clamp_hour(payload.get("sleep_start_hour"))
+        end = _clamp_hour(payload.get("sleep_end_hour"))
+        if start is None or end is None or start == end:
+            return dict(DEFAULT_SLEEP_HOURS)
+        return {"start": start, "end": end}
+    except Exception:
+        return dict(DEFAULT_SLEEP_HOURS)
+
+
+def build_sleep_hours_prompt(
+    *,
+    profile_summary: dict[str, Any],
+    big_five: dict[str, Any] | None,
+) -> str:
+    return (
+        "Infer a plausible nightly sleep window for this person AT HOME, based only "
+        "on their personality.\n\n"
+        "The person is asleep from sleep_start_hour (inclusive) to sleep_end_hour "
+        "(exclusive) on a 24h clock (0-23), wrapping past midnight. Typical windows: "
+        "conscientious early risers ~22->6; night owls ~1->9; most adults ~23->7.\n"
+        "Use the personality cautiously; do not invent medical facts.\n\n"
+        'Return JSON: {"sleep_start_hour": 0-23, "sleep_end_hour": 0-23}\n\n'
+        f"PROFILE SUMMARY:\n{json.dumps(profile_summary, ensure_ascii=False, indent=2)}\n\n"
+        f"BIG FIVE:\n{json.dumps(big_five, ensure_ascii=False)}"
+    )
+
+
+def _clamp_hour(value: Any) -> int | None:
+    try:
+        return int(round(float(value))) % 24
+    except (TypeError, ValueError):
+        return None
 
 
 def generate_profile_description(

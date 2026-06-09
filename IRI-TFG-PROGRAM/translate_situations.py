@@ -95,9 +95,10 @@ def main() -> None:
         if str((s.get("action_input") or {}).get("action_text", "")).strip()
     })
 
-    cached: dict[str, str] = {}
+    cached: dict[str, dict[str, Any]] = {}
     if args.reuse_map and args.map_output.exists():
-        cached = json.loads(args.map_output.read_text(encoding="utf-8"))
+        raw_cached = json.loads(args.map_output.read_text(encoding="utf-8"))
+        cached = {k: _coerce_cached(v, k) for k, v in raw_cached.items()}
     todo = [action for action in unique_actions if action not in cached]
     if args.max_unique is not None:
         todo = todo[: args.max_unique]
@@ -132,9 +133,9 @@ def main() -> None:
         try:
             batches = [todo[i : i + args.batch_size] for i in range(0, len(todo), args.batch_size)]
             for batch_idx, batch in enumerate(batches, start=1):
-                robots = translate_batch(generator=generator, phrases=batch)
-                for phrase, robot in zip(batch, robots):
-                    mapping[phrase] = robot
+                entries = translate_batch(generator=generator, phrases=batch)
+                for phrase, entry in zip(batch, entries):
+                    mapping[phrase] = entry
                 if not args.no_progress and (batch_idx == 1 or batch_idx % 10 == 0 or batch_idx == len(batches)):
                     done = min(batch_idx * args.batch_size, len(todo))
                     print(f"  translated {done}/{len(todo)} unique actions "
@@ -152,12 +153,19 @@ def main() -> None:
         for situation in situations:
             action_input = situation.get("action_input") or {}
             original = str(action_input.get("action_text", "")).strip()
-            robot = mapping.get(original)
-            if robot:
-                action_input["action_text"] = robot
+            entry = mapping.get(original)
+            if entry:
+                action_input["action_text"] = entry["robot_action"]
+                situation["action_input"] = action_input
                 meta = situation.setdefault("source_metadata", {})
                 meta["original_action_text"] = original
-                situation["action_input"] = action_input
+                # robot_autonomous -> top-level (the hourly sleep rule reads it).
+                if entry.get("robot_autonomous") is not None:
+                    situation["robot_autonomous"] = entry["robot_autonomous"]
+                # Qwen-extracted user_state replaces the heuristic dataset one.
+                if entry.get("user_state") is not None:
+                    ctx = situation.setdefault("context_input", {})
+                    ctx["user_state"] = entry["user_state"]
                 rewritten += 1
             out.write(json.dumps(situation, ensure_ascii=False) + "\n")
 
@@ -172,7 +180,9 @@ def main() -> None:
     print("")
     print("Examples:")
     for phrase in list(mapping)[:8]:
-        print(f"  {phrase!r:<45} -> {mapping[phrase]!r}")
+        e = mapping[phrase]
+        print(f"  {phrase!r:<38} -> {e.get('robot_action')!r} "
+              f"[autonomous={e.get('robot_autonomous')}, user_state={e.get('user_state')}]")
     print("=" * 72)
 
 
@@ -180,23 +190,25 @@ def translate_batch(
     *,
     generator: QwenDecisionLabeler,
     phrases: list[str],
-) -> list[str]:
-    """Translate a batch; fall back to per-phrase, then identity, on failure."""
+) -> list[dict[str, Any]]:
+    """Translate+tag a batch. Each entry: {robot_action, robot_autonomous, user_state}.
+
+    Falls back to per-phrase, then identity, on failure.
+    """
     try:
-        robots = _translate_call(generator=generator, phrases=phrases)
-        if len(robots) == len(phrases):
-            return [_clean(robot, fallback=phrase) for robot, phrase in zip(robots, phrases)]
+        items = _translate_call(generator=generator, phrases=phrases)
+        if len(items) == len(phrases):
+            return [_normalize_item(item, phrase) for item, phrase in zip(items, phrases)]
     except Exception:
         pass
 
-    # Misaligned or failed batch: translate each phrase on its own.
-    out: list[str] = []
+    out: list[dict[str, Any]] = []
     for phrase in phrases:
         try:
-            single = _translate_call(generator=generator, phrases=[phrase])
-            out.append(_clean(single[0] if single else "", fallback=phrase))
+            items = _translate_call(generator=generator, phrases=[phrase])
+            out.append(_normalize_item(items[0] if items else {}, phrase))
         except Exception:
-            out.append(phrase)  # last resort: keep the original
+            out.append(_identity_item(phrase))
     return out
 
 
@@ -204,41 +216,88 @@ def _translate_call(
     *,
     generator: QwenDecisionLabeler,
     phrases: list[str],
-) -> list[str]:
+) -> list[Any]:
     payload, _ = generator.generate_json(
         system=(
-            "You convert human daily-living actions into short robot assistance "
-            "actions for a home assistive robot. Return only valid JSON."
+            "You convert human daily-living actions into robot assistance actions and "
+            "tag them. Return only valid JSON."
         ),
         user=build_translation_prompt(phrases),
     )
-    robots = payload.get("robot_actions")
-    if not isinstance(robots, list):
-        raise ValueError("Response missing 'robot_actions' list.")
-    return [str(item) for item in robots]
+    items = payload.get("items")
+    if not isinstance(items, list):
+        raise ValueError("Response missing 'items' list.")
+    return items
 
 
 def build_translation_prompt(phrases: list[str]) -> str:
     numbered = "\n".join(f"{i}. {phrase}" for i, phrase in enumerate(phrases, start=1))
     return (
-        "For each human action below, write the SHORT robot assistance action that "
-        "a home assistive robot could perform or offer in that situation.\n\n"
-        "Rules:\n"
-        "- Robot's perspective, imperative, concise (2-6 words).\n"
-        "- If the robot can do the task itself, keep it as the robot doing it "
-        "(\"make breakfast\" -> \"prepare breakfast\"; \"open door\" -> \"open the door\").\n"
-        "- If it is something only the person does to themselves, reframe it as the "
-        "robot ASSISTING or OFFERING (\"consume pills\" -> \"offer the pills\"; "
-        "\"drink water\" -> \"bring a glass of water\"; \"eat a sandwich\" -> "
-        "\"serve the sandwich\").\n"
-        "- If it is passive or rest (\"lying on a bed\"), use a gentle optional "
-        "assistance (\"check if the user needs anything\").\n"
-        "- Do NOT decide whether the robot should act; only describe the candidate "
-        "action. Do not add explanations.\n\n"
-        "Return JSON exactly as: {\"robot_actions\": [\"...\", \"...\"]} with one "
-        "entry per input action, in the SAME order and the SAME count.\n\n"
+        "For each human action below, return THREE things about the robot's candidate "
+        "assistance in that situation.\n\n"
+        "1) robot_action: the SHORT robot assistance action (robot's perspective, "
+        "imperative, 2-6 words).\n"
+        "   - If the robot can do the task itself, keep it as the robot doing it "
+        "(\"make breakfast\" -> \"prepare breakfast\").\n"
+        "   - If only the person can do it to themselves, reframe as assist/offer "
+        "(\"consume pills\" -> \"offer the pills\"; \"drink water\" -> \"bring a glass of water\").\n"
+        "   - If passive/rest (\"lying on a bed\"), a gentle optional assistance "
+        "(\"check if the user needs anything\").\n"
+        "2) robot_autonomous: true if the robot can carry out this action ON ITS OWN, "
+        "WITHOUT the person present or awake (e.g. tidy the room, water the plants, mop "
+        "the floor); false if it needs the person there/awake (offer/remind/help-walk, "
+        "or anything the person does to themselves).\n"
+        "3) user_state: short list of the person's physical state implied by the action "
+        "(e.g. [\"seated\"], [\"lying_down\",\"in_bed\"], [\"walking\"], [\"standing\"]); "
+        "use [] if none is implied.\n\n"
+        "Do NOT decide whether the robot SHOULD act; only describe the candidate action "
+        "and the two tags.\n\n"
+        "Return JSON exactly as: {\"items\": [{\"robot_action\": \"...\", "
+        "\"robot_autonomous\": true, \"user_state\": [\"...\"]}, ...]} with one entry per "
+        "input action, in the SAME order and the SAME count.\n\n"
         f"Human actions:\n{numbered}"
     )
+
+
+def _normalize_item(item: Any, phrase: str) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        return _identity_item(phrase)
+    robot = _clean(str(item.get("robot_action", "")), fallback=phrase)
+    user_state = item.get("user_state")
+    if isinstance(user_state, list):
+        states: list[str] | None = [str(s).strip() for s in user_state if str(s).strip()]
+    elif user_state:
+        states = [str(user_state).strip()]
+    else:
+        states = []
+    return {
+        "robot_action": robot,
+        "robot_autonomous": _coerce_bool(item.get("robot_autonomous")),
+        "user_state": states,
+    }
+
+
+def _identity_item(phrase: str) -> dict[str, Any]:
+    return {"robot_action": phrase, "robot_autonomous": None, "user_state": None}
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"true", "yes", "1"}:
+        return True
+    if text in {"false", "no", "0"}:
+        return False
+    return None
+
+
+def _coerce_cached(value: Any, phrase: str) -> dict[str, Any]:
+    if isinstance(value, dict) and "robot_action" in value:
+        return value
+    if isinstance(value, str):  # old map format: {phrase: robot_action_str}
+        return {"robot_action": value, "robot_autonomous": None, "user_state": None}
+    return _identity_item(phrase)
 
 
 def _clean(robot: str, *, fallback: str) -> str:
