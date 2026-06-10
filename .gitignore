@@ -1,14 +1,20 @@
 env/
+.venv/
 habitat-sim/
 # habitat-lab/
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 *.DS_Store
-
-
 
 # luka gitignore
 Miniconda3-latest-Linux-x86_64.sh
-IRI-TFG-PROGRAM/generated_data_download/
+
+# IRI-TFG-PROGRAM data and artifacts (local only, not in Git)
+IRI-TFG-PROGRAM/data/
+IRI-TFG-PROGRAM/artifacts/
+IRI-TFG-PROGRAM/archive/
+
+# Legacy paths (kept for backward compat with old clones)
 IRI-TFG-PROGRAM/generated_data/
+IRI-TFG-PROGRAM/generated_data_download/
+IRI-TFG-PROGRAM/external_datasets/
