@@ -7,7 +7,11 @@ import os
 import re
 from typing import Any
 
-from preference_taxonomy import PREFERENCE_SIGNALS, SIGNAL_SEMANTICS, VALID_LABELS
+from iri_tfg_program.taxonomy.preference_taxonomy import (
+    PREFERENCE_SIGNALS,
+    SIGNAL_SEMANTICS,
+    VALID_LABELS,
+)
 
 
 DEFAULT_PREFERENCE_WEIGHT = 5.0
